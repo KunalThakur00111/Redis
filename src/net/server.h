@@ -1,5 +1,5 @@
-#pragma once// prevent this header from being included multiple times 
+#pragma once
 
-namespace net{// groups netwroking functions under net
+namespace net {
     int run_server();
 }
