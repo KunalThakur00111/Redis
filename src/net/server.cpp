@@ -183,7 +183,7 @@ int run_server(std::uint16_t port) {
     while (true) {
         int ready = epoll_wait(
                   epoll_fd, 
-                  ready_events.data(),// a pointer where linux write the data on return;
+                  ready_events.data(),// a pointer where linux write the data on return; and it is overwrite on every iteration.
                   static_cast<int>(ready_events.size()),// max size of data return
                   -1
                   );
