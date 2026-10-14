@@ -47,6 +47,14 @@ std::string execute_command(const std::vector<std::string>& arguments,
         database.values[arguments[1]] = arguments[2];
         return "+OK\r\n";
     }
+    if (name == "MSET") {
+        if (count < 3 || count % 2 == 0) return wrong_argument_count(name);
+        // Arguments after MSET alternate between a key and its value.
+        for (std::size_t i = 1; i < count; i += 2) {
+            database.values[arguments[i]] = arguments[i + 1];
+        }
+        return "+OK\r\n";
+    }
     if (name == "GET") {
         if (count != 2) return wrong_argument_count(name);
         auto found = database.values.find(arguments[1]);

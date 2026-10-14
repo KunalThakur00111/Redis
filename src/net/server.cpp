@@ -4,17 +4,19 @@
 #include "../protocol/resp_parser.h"
 #include "../storage/database.h"
 
+#include <array>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <fcntl.h>
 #include <iostream>
 #include <netinet/in.h>
 #include <string>
-#include <sys/select.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <vector>
+#include <unordered_map>
 
 namespace net {
 namespace {
@@ -27,6 +29,7 @@ struct Client {
     std::string input;
     std::string output;
     bool read_closed = false;
+    std::uint32_t watched_events = EPOLLIN;
 };
 
 // Put a socket in nonblocking mode so accept/recv/send never wait for data.
@@ -91,28 +94,43 @@ bool send_pending(Client& client) {
     return false;
 }
 
+// Watch for writes only while a reply is queued, and stop watching reads after EOF.
+bool update_client_events(int epoll_fd, Client& client) {
+    std::uint32_t wanted = client.read_closed ? 0U : static_cast<std::uint32_t>(EPOLLIN);
+    if (!client.output.empty()) {
+        wanted |= EPOLLOUT;
+    }
+    if (wanted == client.watched_events) {
+        return true;
+    }
+
+    epoll_event event{};
+    event.events = wanted;
+    event.data.fd = client.socket;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD/*for modification*/, client.socket, &event) < 0) {
+        std::cerr << "Epoll client update failed: " << errno << '\n';
+        return false;
+    }
+    client.watched_events = wanted;
+    return true;
+}
+
 // Close all client sockets when the event loop stops.
-void close_clients(const std::vector<Client>& clients) {
-    for (const Client& client : clients) {
-        close(client.socket);
+void close_clients(const std::unordered_map<int, Client>& clients) {
+    for (const auto& entry : clients) {
+        close(entry.first);
     }
 }
 
 }  // namespace
 
-int run_server() {
+int run_server(std::uint16_t port) {
     // Create the TCP socket that accepts new clients.
     int listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {
         std::cerr << "Socket creation failed: " << errno << '\n';
         return 1;
     }
-    if (listener >= FD_SETSIZE) {
-        std::cerr << "Listener descriptor exceeds select limit\n";
-        close(listener);
-        return 1;
-    }
-
     // Allow a quick restart after a previous server instance exits.
     int reuse_address = 1;
     if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse_address,
@@ -122,10 +140,10 @@ int run_server() {
         return 1;
     }
 
-    // Listen only on this machine, on Redis's usual TCP port.
+    // Accept IPv4 connections on every local network interface.
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_port = htons(6379);
+    address.sin_port = htons(port);
     address.sin_addr.s_addr = htonl(INADDR_ANY);
 
     if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0 ||
@@ -135,73 +153,98 @@ int run_server() {
         return 1;
     }
 
-    std::vector<Client> clients;
+    // Create the kernel event watcher; its descriptor must be closed on shutdown.
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd < 0) {
+        std::cerr << "Epoll creation failed: " << errno << '\n';
+        close(listener);
+        return 1;
+    }
+
+    // Ask epoll to report when the listener has a connection ready to accept.
+    epoll_event listener_event{};
+    listener_event.events = EPOLLIN; // Report when accept() can receive a connection. and it is bitmap
+    listener_event.data.fd = listener; // Identify this socket in epoll_wait() results.
+    // Add the listener to this epoll instance with the event mask above.
+    if (epoll_ctl(epoll_fd/*which epoll instance to change*/, EPOLL_CTL_ADD/*for adding the events*/, listener/*which descriptor to add*/, &listener_event/*what kind of that socket is*/) < 0) {
+        std::cerr << "Epoll listener registration failed: " << errno << '\n';
+        close(epoll_fd);
+        close(listener);
+        return 1;
+    }
+
+    std::unordered_map<int, Client> clients;
     storage::Database database;
     int exit_status = 0;
-    std::cout << "Server is listening\n";
+    std::cout << "Listening on 0.0.0.0:" << port << '\n';
 
-    // Rebuild the read/write sets and wait until a socket is ready.
+    // One epoll_wait() returns readiness for both the listener and clients.
+    std::array<epoll_event, 128> ready_events{};
     while (true) {
-        fd_set reads;
-        fd_set writes;
-        FD_ZERO(&reads);
-        FD_ZERO(&writes);
-        FD_SET(listener, &reads);
-        int highest = listener;
-
-        for (const Client& client : clients) {
-            if (!client.read_closed) {
-                FD_SET(client.socket, &reads);
-            }
-            if (!client.output.empty()) {
-                FD_SET(client.socket, &writes);
-            }
-            if (client.socket > highest) {
-                highest = client.socket;
-            }
-        }
-        // fd_set gives bitmap, highest+ or first arguments tell upto how much 
-        // len of bitmap we have to check
-
-        int ready = select(highest + 1, &reads, &writes,
-                           nullptr, nullptr);
+        int ready = epoll_wait(
+                  epoll_fd, 
+                  ready_events.data(),// a pointer where linux write the data on return;
+                  static_cast<int>(ready_events.size()),// max size of data return
+                  -1
+                  );
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            std::cerr << "Select failed: " << errno << '\n';
+            std::cerr << "Epoll wait failed: " << errno << '\n';
             exit_status = 1;
             break;
         }
 
-        // A readable listener has one or more incoming connections.
-        if (FD_ISSET(listener, &reads)) {
-            while (true) {
-                int connection = accept(listener, nullptr, nullptr);
-                if (connection < 0) {
-                    if (!would_block() && errno != EINTR) {
-                        std::cerr << "Accept failed: " << errno << '\n';
+        for (int i = 0; i < ready; i++) {
+            const epoll_event& ready_event = ready_events[static_cast<std::size_t>(i)];
+            int socket = ready_event.data.fd;
+
+            if (socket == listener) {
+                // Level triggering reports the listener again if 16 accepts leave work.
+                int accepted = 0;
+                while (accepted < 16) {
+                    int connection = accept(listener, nullptr, nullptr);
+                    if (connection < 0) {
+                        if (!would_block() && errno != EINTR) {
+                            std::cerr << "Accept failed: " << errno << '\n';
+                        }
+                        break;
                     }
-                    break;
-                }
+                    accepted++;
 
-                // select/FD_SET cannot safely represent descriptors beyond this limit.
-                if (clients.size() >= FD_SETSIZE - 1 ||
-                    connection >= FD_SETSIZE || !make_nonblocking(connection)) {
-                    close(connection);
-                    continue;
+                    if (!make_nonblocking(connection)) {
+                        close(connection);
+                        continue;
+                    }
+
+                    // The new socket needs its own registration for read events.
+                    epoll_event client_event{};
+                    client_event.events = EPOLLIN;
+                    client_event.data.fd = connection;
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, connection,
+                                  &client_event) < 0) {
+                        std::cerr << "Epoll client registration failed: " << errno << '\n';
+                        close(connection);
+                        continue;
+                    }
+                    clients.emplace(connection, Client{connection, {}, {}, false, EPOLLIN});
                 }
-                clients.push_back(Client{connection, {}, {}, false});
+                continue;
             }
-        }
 
-        // Service each ready client, then remove closed or failed connections.
-        for (std::size_t i = 0; i < clients.size();) {
-            Client& client = clients[i];
-            bool remove = false;
+            auto it = clients.find(socket);
+            if (it == clients.end()) {
+                continue;
+            }
+            Client& client = it->second;
+            bool remove = (ready_event.events & EPOLLERR) != 0;
 
-            if (FD_ISSET(client.socket, &reads)) {
-                while (true) {
+            if (!remove && !client.read_closed &&
+                (ready_event.events & (EPOLLIN | EPOLLHUP)) != 0) {
+                // At most four successful reads per event so other clients get time.
+                int reads_this_turn = 0;
+                while (reads_this_turn < 4) {
                     char buffer[4096];
                     ssize_t received = recv(client.socket, buffer, sizeof(buffer), 0);
                     if (received > 0) {
@@ -226,25 +269,30 @@ int run_server() {
                         remove = true;
                         break;
                     }
+                    reads_this_turn++;
                 }
             }
 
-            if (!remove && FD_ISSET(client.socket, &writes)) {
+            if (!remove && (ready_event.events & EPOLLOUT) != 0) {
                 remove = !send_pending(client);
             }
             if (client.read_closed && client.output.empty()) {
                 remove = true;
             }
+            if (!remove) {
+                remove = !update_client_events(epoll_fd, client);
+            }
             if (remove) {
+                // Remove the registration before closing and forgetting the client.
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client.socket, nullptr);
                 close(client.socket);
-                clients.erase(clients.begin() + static_cast<std::ptrdiff_t>(i));
-            } else {
-                ++i;
+                clients.erase(it);
             }
         }
     }
 
     close_clients(clients);
+    close(epoll_fd);
     close(listener);
     return exit_status;
 }

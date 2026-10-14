@@ -19,6 +19,16 @@ def request(*arguments):
     return b"".join(parts)
 
 
+def read_exact(connection, count):
+    reply = bytearray()
+    while len(reply) < count:
+        chunk = connection.recv(count - len(reply))
+        if not chunk:
+            raise RuntimeError("connection closed before the full reply arrived")
+        reply.extend(chunk)
+    return bytes(reply)
+
+
 def exchange(payload, chunks=None):
     with socket.create_connection(ADDRESS, timeout=2) as connection:
         connection.settimeout(2)
@@ -57,6 +67,18 @@ def main():
         echo = request("ECHO", b"a\r\nb")
         assert exchange(echo, [echo[:7], echo[7:]]) == b"$4\r\na\r\nb\r\n"
 
+        # One client's incomplete request must not block another ready client.
+        with socket.create_connection(ADDRESS, timeout=2) as first, \
+             socket.create_connection(ADDRESS, timeout=2) as second:
+            first.settimeout(2)
+            second.settimeout(2)
+            ping = request("PING")
+            first.sendall(ping[:5])
+            second.sendall(ping)
+            assert read_exact(second, 7) == b"+PONG\r\n"
+            first.sendall(ping[5:])
+            assert read_exact(first, 7) == b"+PONG\r\n"
+
         pipeline = (request("SET", "key", "first") +
                     request("SET", "empty", "") +
                     request("SET", "key", "second") +
@@ -71,6 +93,17 @@ def main():
         assert exchange(request("GET", "key")) == b"$-1\r\n"
         assert exchange(request("MGET")) == (
             b"-ERR wrong number of arguments for 'MGET' command\r\n")
+
+        assert exchange(request("MSET", "first", "one", "second", b"a\x00b",
+                                "first", "updated")) == b"+OK\r\n"
+        assert exchange(request("MGET", "first", "second")) == (
+            b"*2\r\n$7\r\nupdated\r\n$3\r\na\x00b\r\n")
+        assert exchange(request("MSET", "orphan")) == (
+            b"-ERR wrong number of arguments for 'MSET' command\r\n")
+        assert exchange(request("MSET", "untouched", "value", "orphan")) == (
+            b"-ERR wrong number of arguments for 'MSET' command\r\n")
+        assert exchange(request("GET", "untouched")) == b"$-1\r\n"
+        assert exchange(request("GET", "orphan")) == b"$-1\r\n"
 
         large = b"x" * 65536
         assert exchange(request("SET", "large", large)) == b"+OK\r\n"

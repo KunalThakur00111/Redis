@@ -1,7 +1,7 @@
-# Redis-compatible learning server
+# Redis-compatible server (in progress)
 
 A small, single-threaded C++17 in-memory server. It accepts RESP arrays of bulk
-strings over TCP and currently supports `PING`, `ECHO`, `SET`, `GET`, `DEL`,
+strings over TCP and currently supports `PING`, `ECHO`, `SET`, `MSET`, `GET`, `DEL`,
 `EXISTS`, `DBSIZE`, and `MGET`. Data is shared between clients and disappears
 when the process exits.
 
@@ -11,7 +11,7 @@ when the process exits.
 TCP client
    │ RESP bytes
    ▼
-net/server.cpp                 select loop, client input/output, socket I/O
+net/server.cpp                 epoll loop, client input/output, socket I/O
    │ complete request                   ▲ encoded reply
    ▼                                    │
 protocol/resp_parser.cpp       commands/command_handler.cpp
@@ -20,10 +20,10 @@ protocol/resp_parser.cpp       commands/command_handler.cpp
                        storage/database.h   protocol/resp_writer.cpp
 ```
 
-The server uses Linux POSIX sockets directly. The parser, writer, commands,
-and database do not use socket types, so a later Linux `epoll` loop could reuse
-them. The current loop uses `select` so the networking behavior stays easy to
-study.
+The server uses Linux POSIX sockets and a level-triggered `epoll` loop.
+The parser, writer, commands, and database do not use socket types.
+The event loop registers the listener and each client with epoll, then waits
+for readable or writable sockets.
 
 Each client has input and output byte buffers. A complete command is parsed,
 run against the one shared database, and encoded into the output buffer.
@@ -39,16 +39,24 @@ From this repository's root:
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build
 ./build/redis-server
+# Or use a different port:
+./build/redis-server --port 6380
 ```
 
-The server listens on `127.0.0.1:6379`. Stop it with Ctrl+C. If port 6379 is
-already occupied, stop the process using that port before starting this one.
+By default the server listens on `0.0.0.0:6379`, meaning all IPv4 network
+interfaces. `--port` accepts a number from 1 to 65535.
+Local clients can use `127.0.0.1`; clients on other devices should use this
+Linux machine's network IP address. The server currently has no authentication,
+so only expose the selected port on a network you trust. Stop it with Ctrl+C.
+If the selected port is already occupied, stop the process using that port
+before starting this one.
 
 In another terminal, if `redis-cli` is installed:
 
 ```sh
 redis-cli -h 127.0.0.1 -p 6379 PING
 redis-cli -h 127.0.0.1 -p 6379 SET name Kunal
+redis-cli -h 127.0.0.1 -p 6379 MSET city Delhi language C++
 redis-cli -h 127.0.0.1 -p 6379 MGET name missing name
 ```
 
@@ -77,6 +85,7 @@ found.
 The parser allows up to 1024 arguments and a 64 KiB bulk string. Each client
 has 128 KiB pending-input and pending-output limits, enough for one maximum
 bulk string plus RESP framing. The server closes a client that exceeds a
-buffer limit or sends invalid RESP. `select` also limits the number of clients
-and usable descriptor values. Fairness budgets, persistence, expiry, and full
-Redis compatibility are future steps.
+buffer limit or sends invalid RESP. The loop accepts at most 16 connections
+and performs at most four successful reads per client event before handling
+other ready events. Persistence, expiry, multithreading, and full Redis
+compatibility are future steps.
