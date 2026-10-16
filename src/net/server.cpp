@@ -40,7 +40,7 @@ bool make_nonblocking(int socket) {
     // F_GETFL means get file status flag
     // F_SETFL means set file status flag
 
-    return flags >= 0 && fcntl(socket, F_SETFL, flags | O_NONBLOCK /* this just set new flag of non blocking while keeping other flags too, that's why OR*/) == 0; 
+    return flags >= 0 && fcntl(socket, F_SETFL, flags | O_NONBLOCK /* this just sets the new flag of non blocking while keeping other flags too, that's why OR*/) == 0; 
     // 0 on success and -1 on failure that's why ==0 check
 }
 
@@ -185,7 +185,7 @@ int run_server(std::uint16_t port) {
                   epoll_fd, 
                   ready_events.data(),// a pointer where linux write the data on return; and it is overwrite on every iteration.
                   static_cast<int>(ready_events.size()),// max size of data return
-                  -1
+                  100// its argument is a timeout in milliseconds.
                   );
         if (ready < 0) {
             if (errno == EINTR) {
@@ -289,8 +289,9 @@ int run_server(std::uint16_t port) {
                 clients.erase(it);
             }
         }
+        database.expire_some(16);
     }
-
+    
     close_clients(clients);
     close(epoll_fd);
     close(listener);

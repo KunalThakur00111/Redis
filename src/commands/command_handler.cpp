@@ -59,41 +59,47 @@ std::string execute_command(const std::vector<std::string>& arguments,
         if (count == 2) return protocol::encode_bulk_string(arguments[1]);
         return wrong_argument_count(name);
     }
+
     if (name == "ECHO") {
         if (count != 2) return wrong_argument_count(name);
         return protocol::encode_bulk_string(arguments[1]);
     }
+
     if (name == "SET") {
         if (count != 3) return wrong_argument_count(name);
-        database.values[arguments[1]] = storage::Entry{arguments[2],std::nullopt};//std::nullopt explicitly means no expiry 
+        database.set(arguments[1],arguments[2]); 
         return "+OK\r\n";
     }
+
     if (name == "MSET") {
         if (count < 3 || count % 2 == 0) return wrong_argument_count(name);
         // Arguments after MSET alternate between a key and its value.
         for (std::size_t i = 1; i < count; i += 2) {
-            database.values[arguments[i]] = storage::Entry{arguments[i + 1],std::nullopt};
+            database.set(arguments[i],arguments[i+1]);
         }
         return "+OK\r\n";
     }
+
     if (name == "GET") {
         if (count != 2) return wrong_argument_count(name);
         auto found = database.find_live(arguments[1]);
         if (found == database.values.end()) return "$-1\r\n";
         return protocol::encode_bulk_string(found->second.value);
     }
+
     if (name == "DEL") {
         if (count < 2) return wrong_argument_count(name);
         std::int64_t removed = 0;
         for (std::size_t i = 1; i < count; ++i) {
             auto found = database.find_live(arguments[i]);// expiry already deleted earlier by their own
             if(found!=database.values.end()){
-                database.values.erase(found);
+                database.erase_entry(found);
                 removed++;
             }
         }
         return protocol::encode_integer(removed);
     }
+
     if (name == "EXISTS") {
         if (count < 2) return wrong_argument_count(name);
         std::int64_t found_count = 0;
@@ -104,11 +110,13 @@ std::string execute_command(const std::vector<std::string>& arguments,
         }
         return protocol::encode_integer(found_count);
     }
+
     if (name == "DBSIZE") {
         if (count != 1) return wrong_argument_count(name);
         return protocol::encode_integer(
             static_cast<std::int64_t>(database.values.size()));
     }
+
     if (name == "MGET") {
         if (count < 2) return wrong_argument_count(name);
         std::vector<std::string> elements;
@@ -121,6 +129,7 @@ std::string execute_command(const std::vector<std::string>& arguments,
         }
         return protocol::encode_array(elements);
     }
+
     if(name == "EXPIRE"){
         if(count != 3) return wrong_argument_count(name);
 
@@ -140,6 +149,78 @@ std::string execute_command(const std::vector<std::string>& arguments,
         return protocol::encode_integer(
             database.expires_at(arguments[1], deadline_ms) ? 1 : 0);
     }
+
+    if(name == "PTTL") {// tells remaining expiry time in milliseconds
+        if(count!=2) return wrong_argument_count(name);
+        return protocol::encode_integer(database.pttl(arguments[1]));
+    }
+
+    if(name == "TTL") {// tells remaining expiry time in seconds
+        if(count!=2) return wrong_argument_count(name);
+        const std::int64_t remaining_ms = database.pttl(arguments[1]);
+        if(remaining_ms < 0) {
+            return protocol::encode_integer(remaining_ms);
+        }
+        return protocol::encode_integer((remaining_ms + 500) / 1000);
+    }
+
+    if(name == "PERSIST"){// reomve the expiry time
+        if(count!=2) return wrong_argument_count(name);
+        return protocol::encode_integer(database.persist(arguments[1])?1:0);
+    }
+
+    if (name == "PEXPIRE") {
+        if (count != 3) return wrong_argument_count(name);
+
+        std::int64_t milliseconds = 0;
+        if (!parse_int64(arguments[2], milliseconds)) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        if (milliseconds > 0 &&
+            milliseconds > std::numeric_limits<std::int64_t>::max() - now_ms) {
+            return "-ERR invalid expire time in 'pexpire' command\r\n";
+        }
+
+        const std::int64_t deadline_ms =
+            milliseconds <= 0 ? now_ms : now_ms + milliseconds;
+
+        return protocol::encode_integer(
+            database.expires_at(arguments[1], deadline_ms) ? 1 : 0);
+    }
+
+    if(name == "EXPIREAT") {//set expires in unix seconds
+        if(count!=3) return wrong_argument_count(name);
+        std::int64_t unix_seconds = 0;
+        if (!parse_int64(arguments[2], unix_seconds)) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+
+        if (unix_seconds > std::numeric_limits<std::int64_t>::max() / 1000 ||
+            unix_seconds < std::numeric_limits<std::int64_t>::min() / 1000) {
+            return "-ERR invalid expire time in 'expireat' command\r\n";
+        }
+
+        const std::int64_t deadline_ms = unix_seconds * 1000;
+        return protocol::encode_integer(
+            database.expires_at(arguments[1], deadline_ms) ? 1 : 0);
+    }
+
+    if(name == "PEXPIREAT") {// set expires in unix milliseconds
+        if (count != 3) return wrong_argument_count(name);
+
+        std::int64_t deadline_ms = 0;
+        if (!parse_int64(arguments[2], deadline_ms)) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+
+        return protocol::encode_integer(
+            database.expires_at(arguments[1], deadline_ms) ? 1 : 0);
+    }
+
     return "-ERR unknown command\r\n";
 }
 }  // namespace commands
