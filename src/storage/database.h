@@ -104,9 +104,19 @@ struct Database {
         return true;
     }
 
-    void set(const std::string& key, const std::string& value){
+    void set(const std::string& key, const std::string& value, const std::optional<std::int64_t>& deadline_ms = std::nullopt){
         untrack_expiry(key);
-        values[key] = Entry{value,std::nullopt};
+        values[key] = Entry{value,deadline_ms};
+        if(deadline_ms){
+            const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+
+            if (*deadline_ms <= now_ms) {
+                values.erase(key);
+            } else {
+                track_expiry(key);
+            }
+        }
     }
 
     std::int64_t pttl(const std::string& key){
@@ -131,7 +141,7 @@ struct Database {
         erase_entry(found);
         return -2;
     }
-    
+
     bool persist(const std::string& key){
         auto found = find_live(key);
         if(found == values.end()) return 0;
@@ -141,5 +151,13 @@ struct Database {
         found->second.expires_at_ms.reset();
         return 1;
     }
+
+    std::int64_t pexpiretime(const std::string& key) {
+        auto found = find_live(key);
+        if (found == values.end()) return -2;
+        if (!found->second.expires_at_ms) return -1;
+        return *found->second.expires_at_ms;
+    }
+
 };
 }  // namespace storage

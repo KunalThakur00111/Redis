@@ -66,8 +66,68 @@ std::string execute_command(const std::vector<std::string>& arguments,
     }
 
     if (name == "SET") {
-        if (count != 3) return wrong_argument_count(name);
-        database.set(arguments[1],arguments[2]); 
+        if (count == 3){
+            database.set(arguments[1],arguments[2]); 
+            return "+OK\r\n";
+        }
+        if(count == 4){
+            const std::string option = uppercase_ascii(arguments[3]);
+            if(option!="NX" && option!="XX"){// "NX" writes only when key don't exits, "XX" writes only when it exits
+                return "-ERR syntax error\r\n";
+            }
+            bool exists = database.find_live(arguments[1])!=database.values.end();
+            if((exists && option=="NX") || (!exists && option=="XX")){
+                return "$-1\r\n";
+            }
+            database.set(arguments[1],arguments[2]);
+            return "+OK\r\n";
+        }
+
+        if(count!=5) return wrong_argument_count(name);
+
+        const std::string option = uppercase_ascii(arguments[3]);
+        if(option!="EX" && option!="PX" && option!="EXAT" && option!="PXAT"){// SET mykey hello EX 5       # store "hello" and expire it after 5 seconds
+            return "-ERR syntax error\r\n";// SET mykey hello PX 500       # store "hello" and expire it after 500 milliseconds
+        }
+
+        std::int64_t duration = 0;
+        if(!parse_int64(arguments[4],duration)){
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+        if(duration<=0){
+            return "-ERR invalid expire time in 'set' command\r\n";
+        }
+
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        const std::int64_t available_ms =
+            std::numeric_limits<std::int64_t>::max() - now_ms;
+
+
+        std::int64_t deadline_ms = 0;
+        if (option == "EX") {
+            if (duration > available_ms / 1000) {
+                return "-ERR invalid expire time in 'set' command\r\n";
+            }
+            deadline_ms = duration*1000 + now_ms; 
+        } 
+        else if (option == "PX") {
+            if(duration > available_ms){
+                return "-ERR invalid expire time in 'set' command\r\n";
+            }
+            deadline_ms = duration + now_ms;
+        }
+        else if(option == "EXAT"){// sets expiry absolute time in unix seconds
+            if (duration > std::numeric_limits<std::int64_t>::max() / 1000) {
+                return "-ERR invalid expire time in 'set' command\r\n";
+            }
+            deadline_ms = duration * 1000;
+        }
+        else{// PXAT
+            deadline_ms = duration;
+        }
+        database.set(arguments[1], arguments[2], deadline_ms);
         return "+OK\r\n";
     }
 
@@ -219,6 +279,25 @@ std::string execute_command(const std::vector<std::string>& arguments,
 
         return protocol::encode_integer(
             database.expires_at(arguments[1], deadline_ms) ? 1 : 0);
+    }
+
+    if(name == "PEXPIRETIME"){// tells expirty time stamp in unix milliseconds
+        if(count != 2) return wrong_argument_count(name);
+        return protocol::encode_integer(database.pexpiretime(arguments[1]));
+    }
+
+    if (name == "EXPIRETIME") {// this tells expiry time stamp in unix seconds
+        if (count != 2) return wrong_argument_count(name);
+
+        const std::int64_t deadline_ms = database.pexpiretime(arguments[1]);
+        if (deadline_ms < 0) {
+            return protocol::encode_integer(deadline_ms);
+        }
+
+        const std::int64_t deadline_seconds =
+            deadline_ms / 1000 + (deadline_ms % 1000 >= 500 ? 1 : 0);
+
+        return protocol::encode_integer(deadline_seconds);
     }
 
     return "-ERR unknown command\r\n";
