@@ -2,8 +2,10 @@
 
 A small, single-threaded C++17 in-memory server. It accepts RESP arrays of bulk
 strings over TCP and currently supports `PING`, `ECHO`, `SET`, `MSET`, `GET`, `DEL`,
-`EXISTS`, `DBSIZE`, and `MGET`. Data is shared between clients and disappears
-when the process exits.
+`EXISTS`, `DBSIZE`, `MGET`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`,
+`TTL`, `PTTL`, `PERSIST`, `EXPIRETIME`, and `PEXPIRETIME`. `SET` supports
+`NX`, `XX`, `EX`, `PX`, `EXAT`, and `PXAT`, including a condition with an expiry.
+Data is shared between clients and disappears when the process exits.
 
 ## Architecture
 
@@ -32,6 +34,9 @@ socket is writable; a client that has finished sending can still receive its
 queued replies before the connection closes.
 
 ## Build and run on Linux
+
+The CMake configuration and tests are kept in this local working copy and are
+excluded from Git. A fresh clone needs those files before these commands work.
 
 From this repository's root:
 
@@ -87,5 +92,5 @@ has 128 KiB pending-input and pending-output limits, enough for one maximum
 bulk string plus RESP framing. The server closes a client that exceeds a
 buffer limit or sends invalid RESP. The loop accepts at most 16 connections
 and performs at most four successful reads per client event before handling
-other ready events. Persistence, expiry, multithreading, and full Redis
+other ready events. Persistence, multithreading, and full Redis
 compatibility are future steps.

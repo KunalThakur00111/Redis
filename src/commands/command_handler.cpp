@@ -70,6 +70,7 @@ std::string execute_command(const std::vector<std::string>& arguments,
             database.set(arguments[1],arguments[2]); 
             return "+OK\r\n";
         }
+
         if(count == 4){
             const std::string option = uppercase_ascii(arguments[3]);
             if(option!="NX" && option!="XX"){// "NX" writes only when key don't exits, "XX" writes only when it exits
@@ -83,15 +84,29 @@ std::string execute_command(const std::vector<std::string>& arguments,
             return "+OK\r\n";
         }
 
-        if(count!=5) return wrong_argument_count(name);
+        if(count!=5 && count!=6) return wrong_argument_count(name);
 
-        const std::string option = uppercase_ascii(arguments[3]);
+        std::string option = uppercase_ascii(arguments[3]);
+        std::string condition;
+        std::size_t expiry_value_index = 4;
+        if (count == 6) {
+            const std::string last_option = uppercase_ascii(arguments[5]);
+            if (option == "NX" || option == "XX") {
+                condition = option;
+                option = uppercase_ascii(arguments[4]);
+                expiry_value_index = 5;
+            } else if (last_option == "NX" || last_option == "XX") {
+                condition = last_option;
+            } else {
+                return "-ERR syntax error\r\n";
+            }
+        }
         if(option!="EX" && option!="PX" && option!="EXAT" && option!="PXAT"){// SET mykey hello EX 5       # store "hello" and expire it after 5 seconds
             return "-ERR syntax error\r\n";// SET mykey hello PX 500       # store "hello" and expire it after 500 milliseconds
         }
 
         std::int64_t duration = 0;
-        if(!parse_int64(arguments[4],duration)){
+        if(!parse_int64(arguments[expiry_value_index],duration)){
             return "-ERR value is not an integer or out of range\r\n";
         }
         if(duration<=0){
@@ -126,6 +141,13 @@ std::string execute_command(const std::vector<std::string>& arguments,
         }
         else{// PXAT
             deadline_ms = duration;
+        }
+        if (!condition.empty()) {
+            const bool exists = database.find_live(arguments[1]) != database.values.end();
+            if ((condition == "NX" && exists) ||
+                (condition == "XX" && !exists)) {
+                return "$-1\r\n";
+            }
         }
         database.set(arguments[1], arguments[2], deadline_ms);
         return "+OK\r\n";
