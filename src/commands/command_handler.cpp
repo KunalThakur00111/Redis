@@ -23,8 +23,28 @@ std::string uppercase_ascii(std::string text) {
     return text;
 }
 
+std::string lower_ascii(std::string text){
+    for (char& ch : text) {
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+    }
+    return text;
+}
+
 std::string wrong_argument_count(const std::string& name) {
-    return "-ERR wrong number of arguments for '" + name + "' command\r\n";
+    return "-ERR wrong number of arguments for '" + lower_ascii(name) + "' command\r\n";
+}
+
+bool arithmetic_parse(const std::string& text){
+    if(text.empty()) return false;
+    if(text.size() == 1 && text[0] == '0') return true;
+    if((text[0]>='1' && text[0]<='9')) return true;
+
+    if(text.size() == 1 && text[0] == '-') return false;
+    if(text.size() > 1 && text[0] == '-' && text[1]>='1' && text[1] <= '9') return true;
+
+    return false;
 }
 
 bool parse_int64(const std::string& text, std::int64_t& value) {
@@ -345,7 +365,7 @@ std::string execute_command(const std::vector<std::string>& arguments,
         }
 
         std::int64_t value = 0;
-        if (!parse_int64(found->second.value, value)) {
+        if (!arithmetic_parse(found->second.value) || !parse_int64(found->second.value, value)) {
             return "-ERR value is not an integer or out of range\r\n";
         }
         if (value == std::numeric_limits<std::int64_t>::max()) {
@@ -353,6 +373,92 @@ std::string execute_command(const std::vector<std::string>& arguments,
         }
 
         value++;
+        found->second.value = std::to_string(value);
+        return protocol::encode_integer(value);
+    }
+
+    if (name == "DECR") {
+        if (count != 2) return wrong_argument_count(name);
+
+        auto found = database.find_live(arguments[1]);
+        if (found == database.values.end()) {
+            database.set(arguments[1], "-1");
+            return protocol::encode_integer(-1);
+        }
+
+        std::int64_t value = 0;
+        if (!arithmetic_parse(found->second.value) || !parse_int64(found->second.value, value)) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+        if (value == std::numeric_limits<std::int64_t>::min()) {
+            return "-ERR increment or decrement would overflow\r\n";
+        }
+
+        value--;
+        found->second.value = std::to_string(value);
+        return protocol::encode_integer(value);
+    }
+
+    if (name == "INCRBY"){
+        if(count != 3) return wrong_argument_count(name);
+
+        auto found = database.find_live(arguments[1]);
+
+        std::int64_t value = 0;
+        if(!arithmetic_parse(arguments[2]) || !parse_int64(arguments[2], value)){
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+
+        if(found == database.values.end()){
+            database.set(arguments[1],arguments[2]);
+            return protocol::encode_integer(value);
+        }
+
+        std::int64_t stored_value=0;
+        if(!arithmetic_parse(found->second.value) || !parse_int64(found->second.value, stored_value)){
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+
+        if ((value > 0 && stored_value > std::numeric_limits<std::int64_t>::max() - value) ||
+            (value < 0 && stored_value < std::numeric_limits<std::int64_t>::min() - value)) {
+            return "-ERR increment or decrement would overflow\r\n";
+        }
+
+        value = value + stored_value;
+        found->second.value = std::to_string(value);
+        return protocol::encode_integer(value);
+    }
+
+    if (name == "DECRBY"){
+        if(count != 3) return wrong_argument_count(name);
+
+        auto found = database.find_live(arguments[1]);
+
+        std::int64_t value = 0;
+    
+        if(!arithmetic_parse(arguments[2]) || !parse_int64(arguments[2], value)){
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+
+        if (value == std::numeric_limits<std::int64_t>::min()) {
+            return "-ERR decrement would overflow\r\n";
+        }
+        value = -value;
+        if(found == database.values.end()){
+            database.set(arguments[1],std::to_string(value));
+            return protocol::encode_integer(value);
+        }
+
+        std::int64_t stored_value=0;
+        if(!arithmetic_parse(found->second.value) || !parse_int64(found->second.value, stored_value)){
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+        if ((value > 0 && stored_value > std::numeric_limits<std::int64_t>::max() - value) ||
+            (value < 0 && stored_value < std::numeric_limits<std::int64_t>::min() - value)) {
+            return "-ERR increment or decrement would overflow\r\n";
+        }
+
+        value = value + stored_value;
         found->second.value = std::to_string(value);
         return protocol::encode_integer(value);
     }

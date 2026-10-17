@@ -98,16 +98,16 @@ def main():
         assert exchange(request("DEL", "key", "key", "missing")) == b":1\r\n"
         assert exchange(request("GET", "key")) == b"$-1\r\n"
         assert exchange(request("MGET")) == (
-            b"-ERR wrong number of arguments for 'MGET' command\r\n")
+            b"-ERR wrong number of arguments for 'mget' command\r\n")
 
         assert exchange(request("MSET", "first", "one", "second", b"a\x00b",
                                 "first", "updated")) == b"+OK\r\n"
         assert exchange(request("MGET", "first", "second")) == (
             b"*2\r\n$7\r\nupdated\r\n$3\r\na\x00b\r\n")
         assert exchange(request("MSET", "orphan")) == (
-            b"-ERR wrong number of arguments for 'MSET' command\r\n")
+            b"-ERR wrong number of arguments for 'mset' command\r\n")
         assert exchange(request("MSET", "untouched", "value", "orphan")) == (
-            b"-ERR wrong number of arguments for 'MSET' command\r\n")
+            b"-ERR wrong number of arguments for 'mset' command\r\n")
         assert exchange(request("GET", "untouched")) == b"$-1\r\n"
         assert exchange(request("GET", "orphan")) == b"$-1\r\n"
 
@@ -115,6 +115,112 @@ def main():
         assert exchange(request("SET", "large", large)) == b"+OK\r\n"
         assert exchange(request("GET", "large")) == (
             b"$65536\r\n" + large + b"\r\n")
+
+        assert exchange(request("INCR", "counter")) == b":1\r\n"
+        assert exchange(request("DECR", "counter")) == b":0\r\n"
+        assert exchange(request("DECR", "missing-counter")) == b":-1\r\n"
+        assert exchange(request("DECR")) == (
+            b"-ERR wrong number of arguments for 'decr' command\r\n")
+
+        assert exchange(request("SET", "signed", "+7")) == b"+OK\r\n"
+        assert exchange(request("INCR", "signed")) == (
+            b"-ERR value is not an integer or out of range\r\n")
+        assert exchange(request("DECR", "signed")) == (
+            b"-ERR value is not an integer or out of range\r\n")
+        assert exchange(request("GET", "signed")) == b"$2\r\n+7\r\n"
+
+        assert exchange(request("SET", "negative", "-7")) == b"+OK\r\n"
+        assert exchange(request("INCR", "negative")) == b":-6\r\n"
+
+        assert exchange(request("SET", "leading-zero", "01")) == b"+OK\r\n"
+        assert exchange(request("INCR", "leading-zero")) == (
+            b"-ERR value is not an integer or out of range\r\n")
+        assert exchange(request("GET", "leading-zero")) == b"$2\r\n01\r\n"
+
+        assert exchange(request("SET", "negative-zero", "-0")) == b"+OK\r\n"
+        assert exchange(request("DECR", "negative-zero")) == (
+            b"-ERR value is not an integer or out of range\r\n")
+        assert exchange(request("GET", "negative-zero")) == b"$2\r\n-0\r\n"
+
+        minimum = "-9223372036854775808"
+        assert exchange(request("SET", "minimum", minimum)) == b"+OK\r\n"
+        assert exchange(request("DECR", "minimum")) == (
+            b"-ERR increment or decrement would overflow\r\n")
+        assert exchange(request("GET", "minimum")) == (
+            b"$20\r\n-9223372036854775808\r\n")
+
+        assert exchange(request("SET", "ttl-counter", "5", "PX", "60000")) == b"+OK\r\n"
+        assert exchange(request("DECR", "ttl-counter")) == b":4\r\n"
+        remaining = exchange(request("PTTL", "ttl-counter"))
+        assert remaining.startswith(b":") and int(remaining[1:-2]) > 0
+
+        assert exchange(request("INCRBY", "incrby-missing", "5")) == b":5\r\n"
+        assert exchange(request("INCRBY", "incrby-missing", "-2")) == b":3\r\n"
+        assert exchange(request("GET", "incrby-missing")) == b"$1\r\n3\r\n"
+        assert exchange(request("INCRBY", "incrby-negative", "-2")) == b":-2\r\n"
+        assert exchange(request("INCRBY", "incrby-missing", "+7")) == (
+            b"-ERR value is not an integer or out of range\r\n")
+        assert exchange(request("GET", "incrby-missing")) == b"$1\r\n3\r\n"
+
+        assert exchange(request("SET", "incrby-bad", "abc")) == b"+OK\r\n"
+        assert exchange(request("INCRBY", "incrby-bad", "1")) == (
+            b"-ERR value is not an integer or out of range\r\n")
+        assert exchange(request("GET", "incrby-bad")) == b"$3\r\nabc\r\n"
+
+        assert exchange(request("SET", "incrby-max", "9223372036854775807")) == b"+OK\r\n"
+        assert exchange(request("INCRBY", "incrby-max", "1")) == (
+            b"-ERR increment or decrement would overflow\r\n")
+        assert exchange(request("GET", "incrby-max")) == (
+            b"$19\r\n9223372036854775807\r\n")
+        assert exchange(request("SET", "incrby-min", minimum)) == b"+OK\r\n"
+        assert exchange(request("INCRBY", "incrby-min", "-1")) == (
+            b"-ERR increment or decrement would overflow\r\n")
+        assert exchange(request("GET", "incrby-min")) == (
+            b"$20\r\n-9223372036854775808\r\n")
+
+        assert exchange(request("SET", "incrby-ttl", "5", "PX", "60000")) == b"+OK\r\n"
+        assert exchange(request("INCRBY", "incrby-ttl", "2")) == b":7\r\n"
+        remaining = exchange(request("PTTL", "incrby-ttl"))
+        assert remaining.startswith(b":") and int(remaining[1:-2]) > 0
+        assert exchange(request("INCRBY", "incrby-ttl")) == (
+            b"-ERR wrong number of arguments for 'incrby' command\r\n")
+
+        assert exchange(request("DECRBY", "decrby-missing", "3")) == b":-3\r\n"
+        assert exchange(request("DECRBY", "decrby-negative", "-3")) == b":3\r\n"
+        assert exchange(request("GET", "decrby-negative")) == b"$1\r\n3\r\n"
+        assert exchange(request("DECRBY", "decrby-negative", "-3")) == b":6\r\n"
+
+        assert exchange(request("DECRBY", "decrby-min-amount", minimum)) == (
+            b"-ERR decrement would overflow\r\n")
+        assert exchange(request("GET", "decrby-min-amount")) == b"$-1\r\n"
+        assert exchange(request("DECRBY", "decrby-negative", minimum)) == (
+            b"-ERR decrement would overflow\r\n")
+        assert exchange(request("GET", "decrby-negative")) == b"$1\r\n6\r\n"
+
+        assert exchange(request("SET", "decrby-min", minimum)) == b"+OK\r\n"
+        assert exchange(request("DECRBY", "decrby-min", "1")) == (
+            b"-ERR increment or decrement would overflow\r\n")
+        assert exchange(request("GET", "decrby-min")) == (
+            b"$20\r\n-9223372036854775808\r\n")
+        assert exchange(request("SET", "decrby-max", "9223372036854775807")) == b"+OK\r\n"
+        assert exchange(request("DECRBY", "decrby-max", "-1")) == (
+            b"-ERR increment or decrement would overflow\r\n")
+        assert exchange(request("GET", "decrby-max")) == (
+            b"$19\r\n9223372036854775807\r\n")
+
+        assert exchange(request("DECRBY", "decrby-negative", "+7")) == (
+            b"-ERR value is not an integer or out of range\r\n")
+        assert exchange(request("SET", "decrby-bad", "abc")) == b"+OK\r\n"
+        assert exchange(request("DECRBY", "decrby-bad", "1")) == (
+            b"-ERR value is not an integer or out of range\r\n")
+        assert exchange(request("GET", "decrby-bad")) == b"$3\r\nabc\r\n"
+
+        assert exchange(request("SET", "decrby-ttl", "5", "PX", "60000")) == b"+OK\r\n"
+        assert exchange(request("DECRBY", "decrby-ttl", "2")) == b":3\r\n"
+        remaining = exchange(request("PTTL", "decrby-ttl"))
+        assert remaining.startswith(b":") and int(remaining[1:-2]) > 0
+        assert exchange(request("DECRBY", "decrby-ttl")) == (
+            b"-ERR wrong number of arguments for 'decrby' command\r\n")
         print("Socket command tests passed")
     finally:
         server.terminate()

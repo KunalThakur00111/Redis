@@ -29,3 +29,6 @@ means its replies and edge cases have been checked against that exact release.
 | EXPIRETIME | Yes | No | |
 | GETDEL | Yes | No | |
 | INCR | Yes | No | |
+| DECR | Yes | No | |
+| INCRBY | Yes | No | |
+| DECRBY | Yes | No | |
