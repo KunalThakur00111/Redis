@@ -95,7 +95,8 @@ std::string execute_command(const std::vector<std::string>& arguments,
                 condition = option;
                 option = uppercase_ascii(arguments[4]);
                 expiry_value_index = 5;
-            } else if (last_option == "NX" || last_option == "XX") {
+            } 
+            else if (last_option == "NX" || last_option == "XX") {
                 condition = last_option;
             } else {
                 return "-ERR syntax error\r\n";
@@ -320,6 +321,18 @@ std::string execute_command(const std::vector<std::string>& arguments,
             deadline_ms / 1000 + (deadline_ms % 1000 >= 500 ? 1 : 0);
 
         return protocol::encode_integer(deadline_seconds);
+    }
+
+    if(name == "GETDEL"){
+        if(count!=2) return wrong_argument_count(name);
+        auto found = database.find_live(arguments[1]);
+        if(found == database.values.end()){
+            return "$-1\r\n";
+        }
+
+        std::string reply = protocol::encode_bulk_string(found->second.value);
+        database.erase_entry(found);
+        return reply;
     }
 
     return "-ERR unknown command\r\n";
