@@ -7,6 +7,10 @@ strings over TCP and currently supports `PING`, `ECHO`, `SET`, `MSET`, `GET`, `D
 `NX`, `XX`, `EX`, `PX`, `EXAT`, and `PXAT`, including a condition with an expiry.
 Data is shared between clients and disappears when the process exits.
 
+## Compatibility target
+
+Redis Open Source 8.2.9. Implement and compare RESP2 behavior first.
+
 ## Architecture
 
 ```text
