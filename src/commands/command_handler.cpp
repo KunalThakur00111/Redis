@@ -323,7 +323,7 @@ std::string execute_command(const std::vector<std::string>& arguments,
         return protocol::encode_integer(deadline_seconds);
     }
 
-    if(name == "GETDEL"){
+    if(name == "GETDEL"){// get and delete key
         if(count!=2) return wrong_argument_count(name);
         auto found = database.find_live(arguments[1]);
         if(found == database.values.end()){
@@ -333,6 +333,28 @@ std::string execute_command(const std::vector<std::string>& arguments,
         std::string reply = protocol::encode_bulk_string(found->second.value);
         database.erase_entry(found);
         return reply;
+    }
+
+    if (name == "INCR") {
+        if (count != 2) return wrong_argument_count(name);
+
+        auto found = database.find_live(arguments[1]);
+        if (found == database.values.end()) {
+            database.set(arguments[1], "1");
+            return protocol::encode_integer(1);
+        }
+
+        std::int64_t value = 0;
+        if (!parse_int64(found->second.value, value)) {
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+        if (value == std::numeric_limits<std::int64_t>::max()) {
+            return "-ERR increment or decrement would overflow\r\n";
+        }
+
+        value++;
+        found->second.value = std::to_string(value);
+        return protocol::encode_integer(value);
     }
 
     return "-ERR unknown command\r\n";
