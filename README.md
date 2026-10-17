@@ -3,8 +3,9 @@
 A small, single-threaded C++17 in-memory server. It accepts RESP arrays of bulk
 strings over TCP and currently supports `PING`, `ECHO`, `SET`, `MSET`, `GET`, `DEL`,
 `EXISTS`, `DBSIZE`, `MGET`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`,
-`TTL`, `PTTL`, `PERSIST`, `EXPIRETIME`, and `PEXPIRETIME`. `SET` supports
-`NX`, `XX`, `EX`, `PX`, `EXAT`, and `PXAT`, including a condition with an expiry.
+`TTL`, `PTTL`, `PERSIST`, `EXPIRETIME`, `PEXPIRETIME`, `GETDEL`, and `INCR`.
+`SET` supports `NX`, `XX`, `EX`, `PX`, `EXAT`, and `PXAT`, including a condition
+with an expiry.
 Data is shared between clients and disappears when the process exits.
 
 ## Compatibility target
@@ -39,8 +40,8 @@ queued replies before the connection closes.
 
 ## Build and run on Linux
 
-The CMake configuration and tests are kept in this local working copy and are
-excluded from Git. A fresh clone needs those files before these commands work.
+CMake configuration and tests are included in the repository. A fresh clone
+needs CMake 3.16 or newer and a C++17 compiler to build the server.
 
 From this repository's root:
 
@@ -75,9 +76,31 @@ To run the parser and real TCP tests:
 ctest --test-dir build --output-on-failure
 ```
 
-The TCP test starts its own server on port 6379, so stop a manually running
-copy first. Python 3 is needed for that test; CMake skips it if Python is not
-found.
+The TCP test starts its own server on a temporary port. Python 3 is needed for
+that test; CMake skips it if Python is not found.
+
+## Optional comparison with Redis 8.2.9
+
+The differential PING test compares raw RESP2 replies from this server and
+Redis Open Source 8.2.9. The reference source and binaries live under the
+ignored `build/reference/` directory. To prepare the reference server on Linux:
+
+```sh
+mkdir -p build/reference
+curl -fL https://download.redis.io/releases/redis-8.2.9.tar.gz -o build/reference/redis-8.2.9.tar.gz
+echo '531b314e5557ad76d941f605b3e3162ac61dc141f37c407e1f91fcfe17ea8c30  build/reference/redis-8.2.9.tar.gz' | sha256sum -c -
+tar -xzf build/reference/redis-8.2.9.tar.gz -C build/reference
+make -C build/reference/redis-8.2.9 -j2
+```
+
+After building this server with CMake, run:
+
+```sh
+python3 tests/differential_ping_test.py
+```
+
+The differential test is separate from the default `ctest` suite because a
+fresh clone does not contain the reference Redis binary.
 
 ## Learning checkpoints
 
