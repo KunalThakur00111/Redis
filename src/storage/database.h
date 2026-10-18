@@ -7,11 +7,13 @@
 #include <chrono>
 #include <cstddef>
 #include <vector>
+#include <deque>
+#include <variant>
 
 namespace storage {
 
 struct Entry{
-    std::string value;
+    std::variant<std::deque<std::string>, std::string> value;
     std::optional<std::int64_t> expires_at_ms;
 };
 

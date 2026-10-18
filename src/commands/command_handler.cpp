@@ -10,10 +10,12 @@
 #include <chrono>
 #include <limits>
 #include <system_error>
+#include <variant>
 
 namespace commands {
 namespace {
 
+constexpr const char* wrong_type_error = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
 std::string uppercase_ascii(std::string text) {
     for (char& ch : text) {
         if (ch >= 'a' && ch <= 'z') {
@@ -187,7 +189,11 @@ std::string execute_command(const std::vector<std::string>& arguments,
         if (count != 2) return wrong_argument_count(name);
         auto found = database.find_live(arguments[1]);
         if (found == database.values.end()) return "$-1\r\n";
-        return protocol::encode_bulk_string(found->second.value);
+
+        auto* stored_string = std::get_if<std::string>(&found->second.value);
+        if(stored_string == nullptr) return wrong_type_error;
+
+        return protocol::encode_bulk_string(*stored_string);
     }
 
     if (name == "DEL") {
@@ -202,9 +208,9 @@ std::string execute_command(const std::vector<std::string>& arguments,
     if (name == "EXISTS") {
         if (count < 2) return wrong_argument_count(name);
         std::int64_t found_count = 0;
-        for (std::size_t i = 1; i < count; ++i) {
+        for (std::size_t i = 1; i < count; i++) {
             if (database.find_live(arguments[i]) != database.values.end()) {
-                ++found_count;
+                found_count++;
             }
         }
         return protocol::encode_integer(found_count);
@@ -220,11 +226,15 @@ std::string execute_command(const std::vector<std::string>& arguments,
         if (count < 2) return wrong_argument_count(name);
         std::vector<std::string> elements;
         elements.reserve(count - 1);
-        for (std::size_t i = 1; i < count; ++i) {
+        for (std::size_t i = 1; i < count; i++) {
             auto found = database.find_live(arguments[i]);
-            elements.push_back(found == database.values.end()
-                                   ? "$-1\r\n"
-                                   : protocol::encode_bulk_string(found->second.value));
+            if(found == database.values.end()){
+                elements.push_back("$-1\r\n");
+                continue;
+            }
+
+            auto* stored_string = std::get_if<std::string>(&found->second.value);
+            elements.push_back(stored_string == nullptr ? "$-1\r\n" : protocol::encode_bulk_string(*stored_string)); 
         }
         return protocol::encode_array(elements);
     }
@@ -346,7 +356,10 @@ std::string execute_command(const std::vector<std::string>& arguments,
             return "$-1\r\n";
         }
 
-        std::string reply = protocol::encode_bulk_string(found->second.value);
+        auto* stored_string = std::get_if<std::string>(&found->second.value);
+        if (stored_string == nullptr) return wrong_type_error;
+
+        std::string reply = protocol::encode_bulk_string(*stored_string);
         database.erase_entry(found);
         return reply;
     }
@@ -360,8 +373,11 @@ std::string execute_command(const std::vector<std::string>& arguments,
             return protocol::encode_integer(1);
         }
 
+        auto* stored_string = std::get_if<std::string>(&found->second.value);
+        if(stored_string == nullptr) return wrong_type_error;
+
         std::int64_t value = 0;
-        if (!arithmetic_parse(found->second.value) || !parse_int64(found->second.value, value)) {
+        if (!arithmetic_parse(*stored_string) || !parse_int64(*stored_string, value)) {
             return "-ERR value is not an integer or out of range\r\n";
         }
         if (value == std::numeric_limits<std::int64_t>::max()) {
@@ -369,7 +385,7 @@ std::string execute_command(const std::vector<std::string>& arguments,
         }
 
         value++;
-        found->second.value = std::to_string(value);
+        *stored_string = std::to_string(value);
         return protocol::encode_integer(value);
     }
 
@@ -382,8 +398,11 @@ std::string execute_command(const std::vector<std::string>& arguments,
             return protocol::encode_integer(-1);
         }
 
+        auto* stored_string = std::get_if<std::string>(&found->second.value);
+        if(stored_string == nullptr) return wrong_type_error;
+
         std::int64_t value = 0;
-        if (!arithmetic_parse(found->second.value) || !parse_int64(found->second.value, value)) {
+        if (!arithmetic_parse(*stored_string) || !parse_int64(*stored_string, value)) {
             return "-ERR value is not an integer or out of range\r\n";
         }
         if (value == std::numeric_limits<std::int64_t>::min()) {
@@ -391,7 +410,7 @@ std::string execute_command(const std::vector<std::string>& arguments,
         }
 
         value--;
-        found->second.value = std::to_string(value);
+        *stored_string = std::to_string(value);
         return protocol::encode_integer(value);
     }
 
@@ -410,8 +429,11 @@ std::string execute_command(const std::vector<std::string>& arguments,
             return protocol::encode_integer(value);
         }
 
+        auto* stored_string = std::get_if<std::string>(&found->second.value);
+        if (stored_string == nullptr) return wrong_type_error;
+
         std::int64_t stored_value=0;
-        if(!arithmetic_parse(found->second.value) || !parse_int64(found->second.value, stored_value)){
+        if(!arithmetic_parse(*stored_string) || !parse_int64(*stored_string, stored_value)){
             return "-ERR value is not an integer or out of range\r\n";
         }
 
@@ -421,7 +443,7 @@ std::string execute_command(const std::vector<std::string>& arguments,
         }
 
         value = value + stored_value;
-        found->second.value = std::to_string(value);
+        *stored_string = std::to_string(value);
         return protocol::encode_integer(value);
     }
 
@@ -445,8 +467,11 @@ std::string execute_command(const std::vector<std::string>& arguments,
             return protocol::encode_integer(value);
         }
 
+        auto* stored_string = std::get_if<std::string>(&found->second.value);
+        if (stored_string == nullptr) return wrong_type_error;
+
         std::int64_t stored_value=0;
-        if(!arithmetic_parse(found->second.value) || !parse_int64(found->second.value, stored_value)){
+        if(!arithmetic_parse(*stored_string) || !parse_int64(*stored_string, stored_value)){
             return "-ERR value is not an integer or out of range\r\n";
         }
         if ((value > 0 && stored_value > std::numeric_limits<std::int64_t>::max() - value) ||
@@ -455,7 +480,7 @@ std::string execute_command(const std::vector<std::string>& arguments,
         }
 
         value = value + stored_value;
-        found->second.value = std::to_string(value);
+        *stored_string = std::to_string(value);
         return protocol::encode_integer(value);
     }
 
