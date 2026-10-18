@@ -184,5 +184,30 @@ struct Database {
         return list->size();
     }
 
+    std::optional<std::vector<std::string>> lrange(const std::string& key, std::int64_t start, std::int64_t stop){
+        auto found = find_live(key);
+        if(found == values.end()) return std::vector<std::string>{};
+
+        auto *ptr = std::get_if<std::deque<std::string>>(&found->second.value);
+        if(ptr == nullptr){
+            return std::nullopt;
+        }
+
+        std::vector<std::string> lists;
+        std::int64_t size = static_cast<std::int64_t>(ptr->size());
+
+        if(start < 0) start += size;
+        if(stop < 0 ) stop += size; 
+
+        if(start < 0) start = 0;
+        if(stop < 0 || start >= size || start > stop) return lists;
+        if(stop >= size) stop = size - 1;
+
+        for(std::int64_t i = start; i <= stop; i++){
+            lists.emplace_back((*ptr)[static_cast<std::size_t>(i)]);
+        }
+        return lists;
+    }
+
 };
 }  // namespace storage

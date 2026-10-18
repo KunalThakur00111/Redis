@@ -496,6 +496,27 @@ std::string execute_command(const std::vector<std::string>& arguments,
         return protocol::encode_integer(length);
     }
 
+    if(name == "LRANGE"){
+        if(count != 4) return wrong_argument_count(name);
+
+        std::int64_t start = 0;
+        std::int64_t stop = 0;
+        if(!parse_int64(arguments[2], start) || !parse_int64(arguments[3], stop)){
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+
+        auto result = database.lrange(arguments[1], start, stop);
+        if(result == std::nullopt) return wrong_type_error;
+
+        std::vector<std::string> elements;
+        elements.reserve(result->size());
+        for(const auto& value : *result){
+            elements.emplace_back(protocol::encode_bulk_string(value));
+        }
+
+        return protocol::encode_array(elements);
+    }
+
     return "-ERR unknown command\r\n";
 }
 }  // namespace commands
