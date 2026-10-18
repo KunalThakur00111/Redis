@@ -83,7 +83,7 @@ namespace protocol{
 
                 if (ch < '0' || ch > '9') {
                     result.status = ParseStatus::invalid;
-                    result.error = "Invalid bulk string length";
+                    result.error = "invalid bulk length";
                     return result;
                 }
 

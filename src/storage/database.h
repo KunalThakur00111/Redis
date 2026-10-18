@@ -159,5 +159,14 @@ struct Database {
         return *found->second.expires_at_ms;
     }
 
+    bool erase_live(const std::string& key){
+        auto found = find_live(key);
+        if(found == values.end()){
+            return false;
+        }
+        erase_entry(found);
+        return true;
+    }
+
 };
 }  // namespace storage

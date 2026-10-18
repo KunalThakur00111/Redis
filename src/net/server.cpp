@@ -29,6 +29,7 @@ struct Client {
     std::string input;
     std::string output;
     bool read_closed = false;
+    bool closed_after_reply = false;
     std::uint32_t watched_events = EPOLLIN;
 };
 
@@ -57,8 +58,14 @@ bool process_input(Client& client, storage::Database& database) {
             return true;
         }
         if (request.status == protocol::ParseStatus::invalid) {
-            std::cerr << "Protocol error: " << request.error << '\n';
-            return false;
+            std::string replyy = "-ERR Protocol error: " + request.error + "\r\n";
+            if(replyy.size() > max_pending_output - client.output.size()){
+                std::cerr << "Client output buffer limit reached\n";
+                return false;
+            }
+            client.output += replyy;
+            client.closed_after_reply = true;
+            return true;
         }
 
         std::string reply = commands::execute_command(request.arguments, database);
@@ -96,7 +103,7 @@ bool send_pending(Client& client) {
 
 // Watch for writes only while a reply is queued, and stop watching reads after EOF.
 bool update_client_events(int epoll_fd, Client& client) {
-    std::uint32_t wanted = client.read_closed ? 0U : static_cast<std::uint32_t>(EPOLLIN);
+    std::uint32_t wanted = (client.read_closed || client.closed_after_reply) ? 0U : static_cast<std::uint32_t>(EPOLLIN);
     if (!client.output.empty()) {
         wanted |= EPOLLOUT;
     }
@@ -228,7 +235,7 @@ int run_server(std::uint16_t port) {
                         close(connection);
                         continue;
                     }
-                    clients.emplace(connection, Client{connection, {}, {}, false, EPOLLIN});
+                    clients.emplace(connection, Client{connection, {}, {}, false,false,EPOLLIN});
                 }
                 continue;
             }
@@ -241,7 +248,7 @@ int run_server(std::uint16_t port) {
             bool remove = (ready_event.events & EPOLLERR) != 0;
 
             if (!remove && !client.read_closed &&
-                (ready_event.events & (EPOLLIN | EPOLLHUP)) != 0) {
+                (ready_event.events & (EPOLLIN | EPOLLHUP)) != 0 && !client.closed_after_reply) {
                 // At most four successful reads per event so other clients get time.
                 int reads_this_turn = 0;
                 while (reads_this_turn < 4) {
@@ -259,6 +266,7 @@ int run_server(std::uint16_t port) {
                             remove = true;
                             break;
                         }
+                        if(client.closed_after_reply) break;
                     } else if (received == 0) {
                         client.read_closed = true;
                         break;
@@ -277,6 +285,9 @@ int run_server(std::uint16_t port) {
                 remove = !send_pending(client);
             }
             if (client.read_closed && client.output.empty()) {
+                remove = true;
+            }
+            if(client.closed_after_reply && client.output.empty()){
                 remove = true;
             }
             if (!remove) {

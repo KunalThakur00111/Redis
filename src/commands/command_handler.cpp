@@ -194,11 +194,7 @@ std::string execute_command(const std::vector<std::string>& arguments,
         if (count < 2) return wrong_argument_count(name);
         std::int64_t removed = 0;
         for (std::size_t i = 1; i < count; ++i) {
-            auto found = database.find_live(arguments[i]);// expiry already deleted earlier by their own
-            if(found!=database.values.end()){
-                database.erase_entry(found);
-                removed++;
-            }
+            removed += database.erase_live(arguments[i]);
         }
         return protocol::encode_integer(removed);
     }

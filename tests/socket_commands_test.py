@@ -91,6 +91,24 @@ def main():
                     request("DBSIZE"))
         assert exchange(pipeline) == b"+OK\r\n+OK\r\n+OK\r\n:2\r\n"
 
+        malformed = b"*1\r\n$x\r\nPING\r\n"
+        for payload, prefix, line_count in (
+            (malformed, b"-ERR Protocol error: ", 1),
+            (request("PING") + malformed, b"+PONG\r\n-ERR Protocol error: ", 2),
+        ):
+            with socket.create_connection(ADDRESS, timeout=2) as connection:
+                connection.settimeout(2)
+                connection.sendall(payload)
+                reply = bytearray()
+                while True:
+                    data = connection.recv(65536)
+                    if not data:
+                        break
+                    reply.extend(data)
+                assert reply.startswith(prefix)
+                assert reply.endswith(b"\r\n")
+                assert reply.count(b"\r\n") == line_count
+
         expected = b"*4\r\n$6\r\nsecond\r\n$-1\r\n$0\r\n\r\n$6\r\nsecond\r\n"
         assert exchange(request("mget", "key", "missing", "empty", "key")) == expected
         assert exchange(request("DBSIZE")) == b":2\r\n"
