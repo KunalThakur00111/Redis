@@ -484,6 +484,18 @@ std::string execute_command(const std::vector<std::string>& arguments,
         return protocol::encode_integer(value);
     }
 
+    if(name == "LPUSH"){// push elements into the list data structure
+        if(count < 3) return wrong_argument_count(name);
+        std::size_t length=0;
+        for(std::size_t i=2; i<count; i++){
+            auto result = database.lpush(arguments[1],arguments[i]);
+            if(result == std::nullopt) return wrong_type_error;
+
+            length=*result;
+        }
+        return protocol::encode_integer(length);
+    }
+
     return "-ERR unknown command\r\n";
 }
 }  // namespace commands

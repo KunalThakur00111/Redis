@@ -239,6 +239,22 @@ def main():
         assert remaining.startswith(b":") and int(remaining[1:-2]) > 0
         assert exchange(request("DECRBY", "decrby-ttl")) == (
             b"-ERR wrong number of arguments for 'decrby' command\r\n")
+
+        assert exchange(request("LPUSH", "list-items", "a", "b", "c")) == b":3\r\n"
+        assert exchange(request("LPUSH", "list-items", "d")) == b":4\r\n"
+        assert exchange(request("GET", "list-items")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("MGET", "list-items", "missing")) == (
+            b"*2\r\n$-1\r\n$-1\r\n")
+        assert exchange(request("GETDEL", "list-items")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("EXISTS", "list-items")) == b":1\r\n"
+        assert exchange(request("SET", "string-value", "original")) == b"+OK\r\n"
+        assert exchange(request("LPUSH", "string-value", "x")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("GET", "string-value")) == b"$8\r\noriginal\r\n"
+        assert exchange(request("LPUSH", "list-items")) == (
+            b"-ERR wrong number of arguments for 'lpush' command\r\n")
         print("Socket command tests passed")
     finally:
         server.terminate()

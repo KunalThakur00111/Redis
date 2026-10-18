@@ -170,5 +170,19 @@ struct Database {
         return true;
     }
 
+    std::optional<std::size_t> lpush(const std::string& key, const std::string& element){
+        auto found = find_live(key);
+
+        if(found == values.end()){
+            values.emplace(key, Entry{std::deque<std::string>{element},std::nullopt});
+            return 1;
+        }
+
+        auto* list = std::get_if<std::deque<std::string>>(&found->second.value);
+        if(list == nullptr) return std::nullopt;
+        list->push_front(element);
+        return list->size();
+    }
+
 };
 }  // namespace storage
