@@ -242,6 +242,14 @@ def main():
 
         assert exchange(request("LPUSH", "list-items", "a", "b", "c")) == b":3\r\n"
         assert exchange(request("LPUSH", "list-items", "d")) == b":4\r\n"
+        assert exchange(request("LRANGE", "list-items", "0", "-1")) == (
+            b"*4\r\n$1\r\nd\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n")
+        assert exchange(request("LRANGE", "list-items", "-2", "-1")) == (
+            b"*2\r\n$1\r\nb\r\n$1\r\na\r\n")
+        assert exchange(request("LRANGE", "list-items", "10", "20")) == b"*0\r\n"
+        assert exchange(request("LRANGE", "missing-list", "0", "-1")) == b"*0\r\n"
+        assert exchange(request("LRANGE", "list-items", "01", "-1")) == (
+            b"-ERR value is not an integer or out of range\r\n")
         assert exchange(request("GET", "list-items")) == (
             b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
         assert exchange(request("MGET", "list-items", "missing")) == (
@@ -250,6 +258,8 @@ def main():
             b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
         assert exchange(request("EXISTS", "list-items")) == b":1\r\n"
         assert exchange(request("SET", "string-value", "original")) == b"+OK\r\n"
+        assert exchange(request("LRANGE", "string-value", "0", "-1")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
         assert exchange(request("LPUSH", "string-value", "x")) == (
             b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
         assert exchange(request("GET", "string-value")) == b"$8\r\noriginal\r\n"

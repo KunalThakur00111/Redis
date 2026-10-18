@@ -501,7 +501,8 @@ std::string execute_command(const std::vector<std::string>& arguments,
 
         std::int64_t start = 0;
         std::int64_t stop = 0;
-        if(!parse_int64(arguments[2], start) || !parse_int64(arguments[3], stop)){
+        if(!arithmetic_parse(arguments[2]) || !parse_int64(arguments[2], start) ||
+           !arithmetic_parse(arguments[3]) || !parse_int64(arguments[3], stop)){
             return "-ERR value is not an integer or out of range\r\n";
         }
 
