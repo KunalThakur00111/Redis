@@ -1,6 +1,0 @@
-/build/
-/.vscode/
-__pycache__/
-*.pyc
-/AGENTS.md
-/CMakeUserPresets.json
