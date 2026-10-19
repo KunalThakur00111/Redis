@@ -25,7 +25,7 @@ def start_server(binary, aof_path):
         port = probe.getsockname()[1]
 
     server = subprocess.Popen(
-        [binary, "--port", str(port), "--aof", str(aof_path)],
+        [binary, "--port", str(port), "--aof", str(aof_path)] + sys.argv[2:],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     for _ in range(100):
         if server.poll() is not None:

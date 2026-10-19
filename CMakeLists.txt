@@ -38,5 +38,9 @@ if(BUILD_TESTING)
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/aof_restart_test.py
                 $<TARGET_FILE:redis-server>)
+        add_test(NAME aof-restart-everysec
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/aof_restart_test.py
+                $<TARGET_FILE:redis-server> --aof-fsync everysec)
     endif()
 endif()

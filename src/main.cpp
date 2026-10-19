@@ -12,6 +12,8 @@ int main(int argc, char* argv[]) {
     std::string aof_path;
     bool port_seen = false;
     bool aof_seen = false;
+    bool fsync_seen = false;
+    bool sync_every_second = false;
 
     // Accept --port and --aof in either order, once each.
     for(int i = 1; i < argc; i += 2){
@@ -31,15 +33,23 @@ int main(int argc, char* argv[]) {
         } else if(option == "--aof" && !aof_seen && argv[i + 1][0] != '\0'){
             aof_path = argv[i + 1];
             aof_seen = true;
+        } else if(option == "--aof-fsync" && !fsync_seen){
+            const std::string_view policy(argv[i + 1]);
+            if(policy != "always" && policy != "everysec") break;
+            sync_every_second = policy == "everysec";
+            fsync_seen = true;
         } else {
             break;
         }
 
-        if(i + 2 == argc) return net::run_server(port, aof_path);
+        if(i + 2 == argc){
+            if(fsync_seen && !aof_seen) break;
+            return net::run_server(port, aof_path, sync_every_second);
+        }
     }
 
     if(argc == 1) return net::run_server(port, aof_path);
     std::cerr << "Usage: " << argv[0]
-              << " [--port 1-65535] [--aof path]\n";
+              << " [--port 1-65535] [--aof path] [--aof-fsync always|everysec]\n";
     return 1;
 }

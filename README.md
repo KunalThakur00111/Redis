@@ -59,6 +59,8 @@ cmake --build build
 ./build/redis-server --port 6380
 # Or keep data in a log across restarts:
 ./build/redis-server --port 6380 --aof build/data.aof
+# Or sync pending log writes approximately once per second:
+./build/redis-server --port 6380 --aof build/data.aof --aof-fsync everysec
 ```
 
 By default the server listens on `0.0.0.0:6379`, meaning all IPv4 network
@@ -77,9 +79,14 @@ describing each affected key's resulting value and absolute expiry deadline.
 An incomplete final record is discarded on restart. This is a custom format,
 not a Redis-compatible AOF file.
 
-The first version calls `fdatasync` before acknowledging each logged write.
-It records a whole affected key after a write and does not compact old records,
-so large values and long-running workloads can make writes and startup slow.
+The default `--aof-fsync always` calls `fdatasync` before acknowledging each
+logged write. `--aof-fsync everysec` acknowledges after writing the record
+and syncs pending writes approximately once per second in the event loop.
+That mode reduces per-write latency but can lose recent acknowledged writes
+after an operating-system crash or power failure; its periodic sync can still
+pause the event loop. The log records a whole affected key after a write and
+does not compact old records, so large values and long-running workloads can
+make writes and startup slow.
 Future mutating commands must be added to the persistence command list. The log
 has no checksum, so corruption inside an otherwise valid record may go undetected.
 

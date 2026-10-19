@@ -139,9 +139,11 @@ void close_clients(const std::unordered_map<int, Client>& clients) {
 
 }  // namespace
 
-int run_server(std::uint16_t port, const std::string& aof_path) {
+int run_server(std::uint16_t port, const std::string& aof_path,
+               bool sync_every_second) {
     storage::Database database;
-    persistence::Aof aof;
+    persistence::Aof aof(sync_every_second ? persistence::SyncPolicy::every_second
+                                            : persistence::SyncPolicy::always);
     std::string aof_error;
     if(!aof.open_and_replay(aof_path, database, aof_error)){
         std::cerr << aof_error << '\n';
@@ -215,6 +217,11 @@ int run_server(std::uint16_t port, const std::string& aof_path) {
                 continue;
             }
             std::cerr << "Epoll wait failed: " << errno << '\n';
+            exit_status = 1;
+            break;
+        }
+        if(!aof.sync_if_due(aof_error)){
+            std::cerr << aof_error << '\n';
             exit_status = 1;
             break;
         }

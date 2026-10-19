@@ -245,10 +245,30 @@ bool Aof::append_after_command(const std::vector<std::string>& arguments,
     if(!write_all(fd_, header, sizeof(header), error) ||
        !write_all(fd_, record.data(), record.size(), error)) return false;
 
+    if(sync_policy_ == SyncPolicy::every_second){
+        if(!dirty_){
+            next_sync_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        }
+        dirty_ = true;
+        return true;
+    }
+
     if(fdatasync(fd_) < 0){
         error = "AOF sync failed: " + std::string(std::strerror(errno));
         return false;
     }
+    return true;
+}
+
+bool Aof::sync_if_due(std::string& error) {
+    if(fd_ < 0 || sync_policy_ != SyncPolicy::every_second || !dirty_ ||
+       std::chrono::steady_clock::now() < next_sync_) return true;
+
+    if(fdatasync(fd_) < 0){
+        error = "AOF sync failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+    dirty_ = false;
     return true;
 }
 
