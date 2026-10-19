@@ -1,10 +1,10 @@
 # Redis-compatible server (in progress)
 
-A small, single-threaded C++17 in-memory server. It accepts RESP arrays of bulk
+A Linux-only, single-threaded C++17 in-memory server. It accepts RESP arrays of bulk
 strings over TCP and currently supports `PING`, `ECHO`, `SET`, `MSET`, `GET`, `DEL`,
 `EXISTS`, `DBSIZE`, `MGET`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`,
 `TTL`, `PTTL`, `PERSIST`, `EXPIRETIME`, `PEXPIRETIME`, `GETDEL`, `INCR`, `DECR`,
-`INCRBY`, and `DECRBY`.
+`INCRBY`, `DECRBY`, `LPUSH`, and `LRANGE`.
 `SET` supports `NX`, `XX`, `EX`, `PX`, `EXAT`, and `PXAT`, including a condition
 with an expiry.
 Data is shared between clients and disappears when the process exits.
@@ -12,6 +12,10 @@ Data is shared between clients and disappears when the process exits.
 ## Compatibility target
 
 Redis Open Source 8.2.9. Implement and compare RESP2 behavior first.
+
+The [three-month roadmap](ROADMAP_3_MONTHS.md) sets the next milestone and its
+testable limits. The [interview guide](INTERVIEW_PREP.md) records the current
+design, known limitations, and questions to revisit as features land.
 
 ## Architecture
 

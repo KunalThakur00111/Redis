@@ -12,8 +12,26 @@
 
 namespace storage {
 
+// A Redis hash maps field names to string values.
+using Hash = std::unordered_map<std::string, std::string>;
+
+// HGET must distinguish a missing field from a key holding the wrong data type.
+struct HashGetResult{
+    bool wrong_type;
+    std::optional<std::string> value;
+};
+
+// A pop needs to distinguish a missing key from a wrong-type key.
+// An existing list with count 0 is also different from a missing key.
+struct ListPopResult{
+    bool wrong_type;
+    bool found;
+    std::vector<std::string> elements;
+};
+
+
 struct Entry{
-    std::variant<std::deque<std::string>, std::string> value;
+    std::variant<std::deque<std::string>, std::string, Hash> value;
     std::optional<std::int64_t> expires_at_ms;
 };
 
@@ -208,6 +226,122 @@ struct Database {
         }
         return lists;
     }
+
+    std::optional<std::size_t> rpush(const std::string& key, const std::string& element){
+        auto found = find_live(key);
+
+        if(found == values.end()){
+            values.emplace(key, Entry{std::deque<std::string>{element}, std::nullopt});
+            return 1;
+        }
+
+        auto* list = std::get_if<std::deque<std::string>>(&found->second.value);
+        if(list == nullptr) return std::nullopt;
+
+        list->push_back(element);
+        return list->size();
+    }
+
+    ListPopResult pop_list(const std::string& key, std::size_t count, bool from_left){
+        auto found = find_live(key);
+        if(found == values.end()) return {false, false, {}};
+
+        auto* list = std::get_if<std::deque<std::string>>(&found->second.value);
+        if(list == nullptr) return {true, true, {}};
+
+        ListPopResult result{false, true, {}};
+        const std::size_t number = count < list->size() ? count : list->size();
+        result.elements.reserve(number);
+
+        // Copy the selected elements in the order Redis will return them.
+        for(std::size_t i = 0; i < number; i++){
+            if(from_left){
+                result.elements.push_back((*list)[i]);
+            } else {
+                result.elements.push_back((*list)[list->size() - 1 - i]);
+            }
+        }
+
+        // Remove them only after the result has been constructed.
+        for(std::size_t i = 0; i < number; i++){
+            if(from_left){
+                list->pop_front();
+            } else {
+                list->pop_back();
+            }
+        }
+
+        // This also removes the key from the expiry index, if it had a TTL.
+        if(list->empty()) erase_entry(found);
+
+        return result;
+    }
+
+    std::optional<std::size_t> llen(const std::string& key){
+        auto found = find_live(key);
+        if(found == values.end()) return std::size_t{0};
+
+        auto* list = std::get_if<std::deque<std::string>>(&found->second.value);
+        if(list == nullptr) return std::nullopt;
+
+        return list->size();
+    }
+
+    std::optional<bool> hset(const std::string& key, const std::string& field,
+                         const std::string& value){
+        auto found = find_live(key);
+
+        // Create a hash if the key does not exist.
+        if(found == values.end()){
+            found = values.emplace(key, Entry{Hash{}, std::nullopt}).first;
+        }
+
+        auto* hash = std::get_if<Hash>(&found->second.value);
+        if(hash == nullptr) return std::nullopt; // Wrong data type.
+
+        // second is true for a new field and false when an existing field was replaced.
+        auto result = hash->insert_or_assign(field, value);
+        return result.second;
+    }
+
+    HashGetResult hget(const std::string& key, const std::string& field){
+        auto found = find_live(key);
+        if(found == values.end()) return {false, std::nullopt};
+
+        auto* hash = std::get_if<Hash>(&found->second.value);
+        if(hash == nullptr) return {true, std::nullopt};
+
+        auto field_found = hash->find(field);
+        if(field_found == hash->end()) return {false, std::nullopt};
+
+        return {false, field_found->second};
+    }
+
+    std::optional<bool> hdel(const std::string& key, const std::string& field){
+        auto found = find_live(key);
+        if(found == values.end()) return false;
+
+        auto* hash = std::get_if<Hash>(&found->second.value);
+        if(hash == nullptr) return std::nullopt;
+
+        const bool removed = hash->erase(field) != 0;
+
+        // Redis removes the key when its hash has no fields left.
+        if(removed && hash->empty()) erase_entry(found);
+
+        return removed;
+    }
+
+    std::optional<std::size_t> hlen(const std::string& key){
+        auto found = find_live(key);
+        if(found == values.end()) return std::size_t{0};
+
+        auto* hash = std::get_if<Hash>(&found->second.value);
+        if(hash == nullptr) return std::nullopt;
+
+        return hash->size();
+    }
+    
 
 };
 }  // namespace storage

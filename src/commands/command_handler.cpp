@@ -518,6 +518,138 @@ std::string execute_command(const std::vector<std::string>& arguments,
         return protocol::encode_array(elements);
     }
 
+    if(name == "RPUSH"){
+        if(count < 3) return wrong_argument_count(name);
+
+        std::size_t length = 0;
+        for(std::size_t i = 2; i < count; i++){
+            auto result = database.rpush(arguments[1], arguments[i]);
+            if(result == std::nullopt) return wrong_type_error;
+            length = *result;
+        }
+
+        return protocol::encode_integer(static_cast<std::int64_t>(length));
+    }
+
+    if(name == "LPOP" || name == "RPOP"){
+        if(count != 2 && count != 3) return wrong_argument_count(name);
+
+        const bool has_count = count == 3;
+        std::int64_t pop_count = 1;
+
+        if(has_count){
+            if(!arithmetic_parse(arguments[2]) ||
+            !parse_int64(arguments[2], pop_count)){
+                return "-ERR value is not an integer or out of range\r\n";
+            }
+            if(pop_count < 0){
+                return "-ERR value is out of range, must be positive\r\n";
+            }
+        }
+
+        auto result = database.pop_list(
+            arguments[1],
+            static_cast<std::size_t>(pop_count),
+            name == "LPOP");
+
+        if(result.wrong_type) return wrong_type_error;
+
+        // Redis uses a null array for the count form and a null bulk string otherwise.
+        if(!result.found) return has_count ? "*-1\r\n" : "$-1\r\n";
+
+        if(!has_count){
+            return protocol::encode_bulk_string(result.elements[0]);
+        }
+
+        std::vector<std::string> encoded_elements;
+        encoded_elements.reserve(result.elements.size());
+        for(const auto& element : result.elements){
+            encoded_elements.push_back(protocol::encode_bulk_string(element));
+        }
+        return protocol::encode_array(encoded_elements);
+    }
+
+    if(name == "LLEN"){
+        if(count != 2) return wrong_argument_count(name);
+
+        auto result = database.llen(arguments[1]);
+        if(result == std::nullopt) return wrong_type_error;
+
+        return protocol::encode_integer(static_cast<std::int64_t>(*result));
+    }
+
+    if(name == "LINDEX"){
+        if(count != 3) return wrong_argument_count(name);
+
+        auto found = database.find_live(arguments[1]);
+        if(found == database.values.end()) return "$-1\r\n";
+
+        auto* list = std::get_if<std::deque<std::string>>(&found->second.value);
+        if(list == nullptr) return wrong_type_error;
+
+        std::int64_t index = 0;
+        if(!arithmetic_parse(arguments[2]) ||
+        !parse_int64(arguments[2], index)){
+            return "-ERR value is not an integer or out of range\r\n";
+        }
+
+        const std::int64_t length = static_cast<std::int64_t>(list->size());
+
+        // -1 means the last element, -2 the one before it.
+        if(index < 0) index += length;
+        if(index < 0 || index >= length) return "$-1\r\n";
+
+        return protocol::encode_bulk_string((*list)[static_cast<std::size_t>(index)]);
+    }
+
+    if(name == "HSET"){
+    // HSET key field value [field value ...]
+        if(count < 4 || count % 2 != 0) return wrong_argument_count(name);
+
+        std::int64_t added = 0;
+        for(std::size_t i = 2; i < count; i += 2){
+            auto result = database.hset(arguments[1], arguments[i], arguments[i + 1]);
+            if(result == std::nullopt) return wrong_type_error;
+            if(*result) added++;
+        }
+
+        // Replacing an existing field does not increase this count.
+        return protocol::encode_integer(added);
+    }
+
+    if(name == "HGET"){
+        if(count != 3) return wrong_argument_count(name);
+
+        auto result = database.hget(arguments[1], arguments[2]);
+        if(result.wrong_type) return wrong_type_error;
+        if(result.value == std::nullopt) return "$-1\r\n";
+
+        return protocol::encode_bulk_string(*result.value);
+    }
+
+    if(name == "HDEL"){
+        // HDEL key field [field ...]
+        if(count < 3) return wrong_argument_count(name);
+
+        std::int64_t removed = 0;
+        for(std::size_t i = 2; i < count; i++){
+            auto result = database.hdel(arguments[1], arguments[i]);
+            if(result == std::nullopt) return wrong_type_error;
+            if(*result) removed++;
+        }
+
+        return protocol::encode_integer(removed);
+    }
+
+    if(name == "HLEN"){
+        if(count != 2) return wrong_argument_count(name);
+
+        auto result = database.hlen(arguments[1]);
+        if(result == std::nullopt) return wrong_type_error;
+
+        return protocol::encode_integer(static_cast<std::int64_t>(*result));
+    }
+
     return "-ERR unknown command\r\n";
 }
 }  // namespace commands

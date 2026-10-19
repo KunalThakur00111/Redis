@@ -265,6 +265,83 @@ def main():
         assert exchange(request("GET", "string-value")) == b"$8\r\noriginal\r\n"
         assert exchange(request("LPUSH", "list-items")) == (
             b"-ERR wrong number of arguments for 'lpush' command\r\n")
+
+        assert exchange(request("RPUSH", "queue", "a", "b", "c")) == b":3\r\n"
+        assert exchange(request("LRANGE", "queue", "0", "-1")) == (
+            b"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n")
+        assert exchange(request("LINDEX", "queue", "0")) == b"$1\r\na\r\n"
+        assert exchange(request("LINDEX", "queue", "-1")) == b"$1\r\nc\r\n"
+        assert exchange(request("LINDEX", "queue", "3")) == b"$-1\r\n"
+        assert exchange(request("LINDEX", "missing-list", "0")) == b"$-1\r\n"
+        assert exchange(request("LLEN", "queue")) == b":3\r\n"
+        assert exchange(request("LLEN", "missing-list")) == b":0\r\n"
+        assert exchange(request("LPOP", "queue")) == b"$1\r\na\r\n"
+        assert exchange(request("LPOP", "queue", "0")) == b"*0\r\n"
+        assert exchange(request("LLEN", "queue")) == b":2\r\n"
+        assert exchange(request("RPOP", "queue", "2")) == (
+            b"*2\r\n$1\r\nc\r\n$1\r\nb\r\n")
+        assert exchange(request("EXISTS", "queue")) == b":0\r\n"
+        assert exchange(request("RPOP", "queue")) == b"$-1\r\n"
+        assert exchange(request("LPOP", "queue", "2")) == b"*-1\r\n"
+        assert exchange(request("LPOP", "queue", "-1")) == (
+            b"-ERR value is out of range, must be positive\r\n")
+        assert exchange(request("RPOP", "queue", "bad")) == (
+            b"-ERR value is not an integer or out of range\r\n")
+        assert exchange(request("RPUSH", "string-value", "x")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("LPOP", "string-value")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("RPOP", "string-value", "0")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("LLEN", "string-value")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("LINDEX", "string-value", "0")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+
+        assert exchange(request("RPUSH", "expiring-list", "a", "b")) == b":2\r\n"
+        assert exchange(request("PEXPIRE", "expiring-list", "60000")) == b":1\r\n"
+        assert exchange(request("LPOP", "expiring-list")) == b"$1\r\na\r\n"
+        remaining = exchange(request("PTTL", "expiring-list"))
+        assert remaining.startswith(b":") and int(remaining[1:-2]) > 0
+        assert exchange(request("RPOP", "expiring-list")) == b"$1\r\nb\r\n"
+        assert exchange(request("PTTL", "expiring-list")) == b":-2\r\n"
+
+        assert exchange(request("HSET", "profile", "name", "Kunal", "place", "Delhi")) == b":2\r\n"
+        assert exchange(request("HSET", "profile", "name", "Sam", "age", "21", "age", "22")) == b":1\r\n"
+        assert exchange(request("HGET", "profile", "name")) == b"$3\r\nSam\r\n"
+        assert exchange(request("HGET", "profile", "age")) == b"$2\r\n22\r\n"
+        assert exchange(request("HGET", "profile", "missing")) == b"$-1\r\n"
+        assert exchange(request("HLEN", "profile")) == b":3\r\n"
+        assert exchange(request("HDEL", "profile", "name", "name", "missing")) == b":1\r\n"
+        assert exchange(request("HLEN", "profile")) == b":2\r\n"
+        assert exchange(request("HDEL", "profile", "place", "age")) == b":2\r\n"
+        assert exchange(request("EXISTS", "profile")) == b":0\r\n"
+        assert exchange(request("HGET", "profile", "name")) == b"$-1\r\n"
+        assert exchange(request("HLEN", "profile")) == b":0\r\n"
+        assert exchange(request("HSET", "broken-hash", "field")) == (
+            b"-ERR wrong number of arguments for 'hset' command\r\n")
+        assert exchange(request("EXISTS", "broken-hash")) == b":0\r\n"
+        assert exchange(request("HSET", "string-value", "field", "value")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("HGET", "list-items", "field")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("HDEL", "list-items", "field")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("HLEN", "list-items")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+
+        assert exchange(request("HSET", "binary-hash", b"f\x00", b"a\x00b")) == b":1\r\n"
+        assert exchange(request("HGET", "binary-hash", b"f\x00")) == b"$3\r\na\x00b\r\n"
+        assert exchange(request("HDEL", "binary-hash", b"f\x00")) == b":1\r\n"
+        assert exchange(request("EXISTS", "binary-hash")) == b":0\r\n"
+
+        assert exchange(request("HSET", "expiring-hash", "first", "a")) == b":1\r\n"
+        assert exchange(request("PEXPIRE", "expiring-hash", "60000")) == b":1\r\n"
+        assert exchange(request("HSET", "expiring-hash", "second", "b")) == b":1\r\n"
+        remaining = exchange(request("PTTL", "expiring-hash"))
+        assert remaining.startswith(b":") and int(remaining[1:-2]) > 0
+        assert exchange(request("HDEL", "expiring-hash", "first", "second")) == b":2\r\n"
+        assert exchange(request("PTTL", "expiring-hash")) == b":-2\r\n"
         print("Socket command tests passed")
     finally:
         server.terminate()

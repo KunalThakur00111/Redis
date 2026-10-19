@@ -32,3 +32,5 @@ means its replies and edge cases have been checked against that exact release.
 | DECR | Yes | No | |
 | INCRBY | Yes | No | |
 | DECRBY | Yes | No | |
+| LPUSH | Yes | No | Supports one or more elements; focused Redis 8.2.9 comparison and socket checks exist. |
+| LRANGE | Yes | No | Inclusive and negative indexes; focused Redis 8.2.9 comparison and socket checks exist. |
