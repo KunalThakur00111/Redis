@@ -12,6 +12,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(redis-server
     src/main.cpp
     src/net/server.cpp
+    src/persistence/aof.cpp
     src/protocol/resp_parser.cpp
     src/protocol/resp_writer.cpp
     src/commands/command_handler.cpp
@@ -32,6 +33,10 @@ if(BUILD_TESTING)
         add_test(NAME socket-commands
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/socket_commands_test.py
+                $<TARGET_FILE:redis-server>)
+        add_test(NAME aof-restart
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/aof_restart_test.py
                 $<TARGET_FILE:redis-server>)
     endif()
 endif()

@@ -1,6 +1,7 @@
 #include "server.h"
 
 #include "../commands/command_handler.h"
+#include "../persistence/aof.h"
 #include "../protocol/resp_parser.h"
 #include "../storage/database.h"
 
@@ -51,7 +52,8 @@ bool would_block() {
 }
 
 // Parse every complete request currently buffered and queue its reply.
-bool process_input(Client& client, storage::Database& database) {
+bool process_input(Client& client, storage::Database& database,
+                   persistence::Aof& aof, bool& aof_failed) {
     while (true) {
         auto request = protocol::parse_request(client.input);
         if (request.status == protocol::ParseStatus::incomplete) {
@@ -69,6 +71,12 @@ bool process_input(Client& client, storage::Database& database) {
         }
 
         std::string reply = commands::execute_command(request.arguments, database);
+        std::string aof_error;
+        if(!aof.append_after_command(request.arguments, reply, database, aof_error)){
+            std::cerr << aof_error << '\n';
+            aof_failed = true;
+            return false;
+        }
         if (reply.size() > max_pending_output - client.output.size()) {
             std::cerr << "Client output buffer limit reached\n";
             return false;
@@ -131,7 +139,15 @@ void close_clients(const std::unordered_map<int, Client>& clients) {
 
 }  // namespace
 
-int run_server(std::uint16_t port) {
+int run_server(std::uint16_t port, const std::string& aof_path) {
+    storage::Database database;
+    persistence::Aof aof;
+    std::string aof_error;
+    if(!aof.open_and_replay(aof_path, database, aof_error)){
+        std::cerr << aof_error << '\n';
+        return 1;
+    }
+
     // Create the TCP socket that accepts new clients.
     int listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {
@@ -181,8 +197,8 @@ int run_server(std::uint16_t port) {
     }
 
     std::unordered_map<int, Client> clients;
-    storage::Database database;
     int exit_status = 0;
+    bool aof_failed = false;
     std::cout << "Listening on 0.0.0.0:" << port << '\n';
 
     // One epoll_wait() returns readiness for both the listener and clients.
@@ -204,6 +220,7 @@ int run_server(std::uint16_t port) {
         }
 
         for (int i = 0; i < ready; i++) {
+            if(aof_failed) break;
             const epoll_event& ready_event = ready_events[static_cast<std::size_t>(i)];
             int socket = ready_event.data.fd;
 
@@ -262,7 +279,7 @@ int run_server(std::uint16_t port) {
                             break;
                         }
                         client.input.append(buffer, count);
-                        if (!process_input(client, database)) {
+                        if (!process_input(client, database, aof, aof_failed)) {
                             remove = true;
                             break;
                         }
@@ -299,6 +316,10 @@ int run_server(std::uint16_t port) {
                 close(client.socket);
                 clients.erase(it);
             }
+        }
+        if(aof_failed){
+            exit_status = 1;
+            break;
         }
         database.expire_some(16);
     }

@@ -9,7 +9,8 @@ strings over TCP and currently supports `PING`, `ECHO`, `SET`, `MSET`, `GET`, `D
 `SCARD`, and `SMEMBERS`.
 `SET` supports `NX`, `XX`, `EX`, `PX`, `EXAT`, and `PXAT`, including a condition
 with an expiry.
-Data is shared between clients and disappears when the process exits.
+Data is shared between clients. By default it disappears when the process exits;
+the optional append-only log described below restores it on restart.
 
 ## Compatibility target
 
@@ -56,6 +57,8 @@ cmake --build build
 ./build/redis-server
 # Or use a different port:
 ./build/redis-server --port 6380
+# Or keep data in a log across restarts:
+./build/redis-server --port 6380 --aof build/data.aof
 ```
 
 By default the server listens on `0.0.0.0:6379`, meaning all IPv4 network
@@ -65,6 +68,20 @@ Linux machine's network IP address. The server currently has no authentication,
 so only expose the selected port on a network you trust. Stop it with Ctrl+C.
 If the selected port is already occupied, stop the process using that port
 before starting this one.
+
+## Optional persistence
+
+Pass `--aof path` to replay an existing log at startup and record later writes.
+The parent directory must exist. The log stores length-framed RESP commands
+describing each affected key's resulting value and absolute expiry deadline.
+An incomplete final record is discarded on restart. This is a custom format,
+not a Redis-compatible AOF file.
+
+The first version calls `fdatasync` before acknowledging each logged write.
+It records a whole affected key after a write and does not compact old records,
+so large values and long-running workloads can make writes and startup slow.
+Future mutating commands must be added to the persistence command list. The log
+has no checksum, so corruption inside an otherwise valid record may go undetected.
 
 In another terminal, if `redis-cli` is installed:
 
@@ -124,5 +141,5 @@ has 128 KiB pending-input and pending-output limits, enough for one maximum
 bulk string plus RESP framing. The server closes a client that exceeds a
 buffer limit or sends invalid RESP. The loop accepts at most 16 connections
 and performs at most four successful reads per client event before handling
-other ready events. Persistence, multithreading, and full Redis
+other ready events. Multithreading and full Redis
 compatibility are future steps.
