@@ -9,11 +9,15 @@
 #include <vector>
 #include <deque>
 #include <variant>
+#include <unordered_set>
 
 namespace storage {
 
 // A Redis hash maps field names to string values.
 using Hash = std::unordered_map<std::string, std::string>;
+
+// A set contains unique string members; members do not have values.
+using Set = std::unordered_set<std::string>;
 
 // HGET must distinguish a missing field from a key holding the wrong data type.
 struct HashGetResult{
@@ -31,7 +35,7 @@ struct ListPopResult{
 
 
 struct Entry{
-    std::variant<std::deque<std::string>, std::string, Hash> value;
+    std::variant<std::deque<std::string>, std::string, Hash, Set> value;
     std::optional<std::int64_t> expires_at_ms;
 };
 
@@ -342,6 +346,80 @@ struct Database {
         return hash->size();
     }
     
+    std::optional<bool> sadd(const std::string& key, const std::string& member){
+        auto found = find_live(key);
+
+        if(found == values.end()){
+            // The first member creates both the set and its Redis key.
+            values.emplace(key, Entry{Set{member}, std::nullopt});
+            return true;
+        }
+
+        auto* set = std::get_if<Set>(&found->second.value);
+        if(set == nullptr) return std::nullopt;
+ 
+        // insert returns false when this member was already present.
+        return set->insert(member).second;
+        
+        /*
+        set->insert(member) gives two things:
+        1) .first gives Iterator pointing to the member in the set
+        2) .second gives bool: true if newly inserted, false if already present
+        */
+    }
+
+    std::optional<bool> srem(const std::string& key, const std::string& member){
+        auto found = find_live(key);
+        if(found == values.end()) return false;
+
+        auto* set = std::get_if<Set>(&found->second.value);
+        if(set == nullptr) return std::nullopt;
+
+        const bool removed = set->erase(member) != 0;
+
+        // Redis removes the key when its final member is removed.
+        if(removed && set->empty()) erase_entry(found);
+
+        return removed;
+    }
+
+    std::optional<bool> sismember(const std::string& key, const std::string& member){
+        auto found = find_live(key);
+        if(found == values.end()) return false;
+
+        auto* set = std::get_if<Set>(&found->second.value);
+        if(set == nullptr) return std::nullopt;
+
+        return set->find(member) != set->end();
+    }
+
+    std::optional<std::size_t> scard(const std::string& key){
+        auto found = find_live(key);
+        if(found == values.end()) return std::size_t{0};
+
+        auto* set = std::get_if<Set>(&found->second.value);
+        if(set == nullptr) return std::nullopt;
+
+        return set->size();
+    }
+
+    std::optional<std::vector<std::string>> smembers(const std::string& key){
+        auto found = find_live(key);
+        if(found == values.end()) return std::vector<std::string>{};
+
+        auto* set = std::get_if<Set>(&found->second.value);
+        if(set == nullptr) return std::nullopt;
+
+        std::vector<std::string> members;
+        members.reserve(set->size());
+
+        // A set has no defined order, so this order must not be relied upon.
+        for(const auto& member : *set){
+            members.push_back(member);
+        }
+
+        return members;
+    }
 
 };
 }  // namespace storage

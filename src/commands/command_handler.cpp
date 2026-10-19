@@ -650,6 +650,67 @@ std::string execute_command(const std::vector<std::string>& arguments,
         return protocol::encode_integer(static_cast<std::int64_t>(*result));
     }
 
+    if(name == "SADD"){
+        // SADD key member [member ...]
+        if(count < 3) return wrong_argument_count(name);
+
+        std::int64_t added = 0;
+        for(std::size_t i = 2; i < count; i++){
+            auto result = database.sadd(arguments[1], arguments[i]);
+            if(result == std::nullopt) return wrong_type_error;
+            if(*result) added++;
+        }
+
+        return protocol::encode_integer(added);
+    }
+
+    if(name == "SREM"){
+        // SREM key member [member ...]
+        if(count < 3) return wrong_argument_count(name);
+
+        std::int64_t removed = 0;
+        for(std::size_t i = 2; i < count; i++){
+            auto result = database.srem(arguments[1], arguments[i]);
+            if(result == std::nullopt) return wrong_type_error;
+            if(*result) removed++;
+        }
+
+        return protocol::encode_integer(removed);
+    }
+
+    if(name == "SISMEMBER"){
+        if(count != 3) return wrong_argument_count(name);
+
+        auto result = database.sismember(arguments[1], arguments[2]);
+        if(result == std::nullopt) return wrong_type_error;
+
+        return protocol::encode_integer(*result ? 1 : 0);
+    }
+
+    if(name == "SCARD"){
+        if(count != 2) return wrong_argument_count(name);
+
+        auto result = database.scard(arguments[1]);
+        if(result == std::nullopt) return wrong_type_error;
+
+        return protocol::encode_integer(static_cast<std::int64_t>(*result));
+    }
+
+    if(name == "SMEMBERS"){
+        if(count != 2) return wrong_argument_count(name);
+
+        auto result = database.smembers(arguments[1]);
+        if(result == std::nullopt) return wrong_type_error;
+
+        std::vector<std::string> encoded_members;
+        encoded_members.reserve(result->size());
+        for(const auto& member : *result){
+            encoded_members.push_back(protocol::encode_bulk_string(member));
+        }
+
+        return protocol::encode_array(encoded_members);
+    }
+
     return "-ERR unknown command\r\n";
 }
 }  // namespace commands

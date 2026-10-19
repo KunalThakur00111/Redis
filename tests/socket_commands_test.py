@@ -19,6 +19,25 @@ def request(*arguments):
     return b"".join(parts)
 
 
+def decode_bulk_array(reply):
+    header, separator, remaining = reply.partition(b"\r\n")
+    assert separator == b"\r\n" and header.startswith(b"*")
+    count = int(header[1:])
+    assert count >= 0
+
+    members = []
+    for _ in range(count):
+        length_line, separator, remaining = remaining.partition(b"\r\n")
+        assert separator == b"\r\n" and length_line.startswith(b"$")
+        length = int(length_line[1:])
+        assert length >= 0 and remaining[length:length + 2] == b"\r\n"
+        members.append(remaining[:length])
+        remaining = remaining[length + 2:]
+
+    assert remaining == b""
+    return members
+
+
 def read_exact(connection, count):
     reply = bytearray()
     while len(reply) < count:
@@ -342,6 +361,47 @@ def main():
         assert remaining.startswith(b":") and int(remaining[1:-2]) > 0
         assert exchange(request("HDEL", "expiring-hash", "first", "second")) == b":2\r\n"
         assert exchange(request("PTTL", "expiring-hash")) == b":-2\r\n"
+
+        assert exchange(request("SADD", "members", "alice", "bob", "alice")) == b":2\r\n"
+        assert exchange(request("SADD", "members", "bob", b"a\x00b")) == b":1\r\n"
+        assert exchange(request("SCARD", "members")) == b":3\r\n"
+        assert exchange(request("SISMEMBER", "members", "alice")) == b":1\r\n"
+        assert exchange(request("SISMEMBER", "members", "missing")) == b":0\r\n"
+        assert exchange(request("SISMEMBER", "members", b"a\x00b")) == b":1\r\n"
+        assert sorted(decode_bulk_array(exchange(request("SMEMBERS", "members")))) == (
+            [b"a\x00b", b"alice", b"bob"])
+        assert exchange(request("SREM", "members", "bob", "bob", "missing")) == b":1\r\n"
+        assert exchange(request("SCARD", "members")) == b":2\r\n"
+        assert exchange(request("SREM", "members", "alice", b"a\x00b")) == b":2\r\n"
+        assert exchange(request("EXISTS", "members")) == b":0\r\n"
+        assert exchange(request("SCARD", "members")) == b":0\r\n"
+        assert exchange(request("SISMEMBER", "members", "alice")) == b":0\r\n"
+        assert exchange(request("SMEMBERS", "members")) == b"*0\r\n"
+        assert exchange(request("SREM", "members", "alice")) == b":0\r\n"
+
+        assert exchange(request("SADD", "expiring-set", "first")) == b":1\r\n"
+        assert exchange(request("PEXPIRE", "expiring-set", "60000")) == b":1\r\n"
+        assert exchange(request("SADD", "expiring-set", "second")) == b":1\r\n"
+        remaining = exchange(request("PTTL", "expiring-set"))
+        assert remaining.startswith(b":") and int(remaining[1:-2]) > 0
+        assert exchange(request("SREM", "expiring-set", "first", "second")) == b":2\r\n"
+        assert exchange(request("PTTL", "expiring-set")) == b":-2\r\n"
+
+        assert exchange(request("SADD", "string-value", "x")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("SREM", "list-items", "x")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("SISMEMBER", "list-items", "x")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("SCARD", "list-items")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("SMEMBERS", "list-items")) == (
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+        assert exchange(request("SADD", "bad-set")) == (
+            b"-ERR wrong number of arguments for 'sadd' command\r\n")
+        assert exchange(request("SREM", "bad-set")) == (
+            b"-ERR wrong number of arguments for 'srem' command\r\n")
+        assert exchange(request("EXISTS", "bad-set")) == b":0\r\n"
         print("Socket command tests passed")
     finally:
         server.terminate()

@@ -4,7 +4,9 @@ A Linux-only, single-threaded C++17 in-memory server. It accepts RESP arrays of 
 strings over TCP and currently supports `PING`, `ECHO`, `SET`, `MSET`, `GET`, `DEL`,
 `EXISTS`, `DBSIZE`, `MGET`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`,
 `TTL`, `PTTL`, `PERSIST`, `EXPIRETIME`, `PEXPIRETIME`, `GETDEL`, `INCR`, `DECR`,
-`INCRBY`, `DECRBY`, `LPUSH`, and `LRANGE`.
+`INCRBY`, `DECRBY`, `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`,
+`LINDEX`, `HSET`, `HGET`, `HDEL`, `HLEN`, `SADD`, `SREM`, `SISMEMBER`,
+`SCARD`, and `SMEMBERS`.
 `SET` supports `NX`, `XX`, `EX`, `PX`, `EXAT`, and `PXAT`, including a condition
 with an expiry.
 Data is shared between clients and disappears when the process exits.
@@ -13,9 +15,7 @@ Data is shared between clients and disappears when the process exits.
 
 Redis Open Source 8.2.9. Implement and compare RESP2 behavior first.
 
-The [three-month roadmap](ROADMAP_3_MONTHS.md) sets the next milestone and its
-testable limits. The [interview guide](INTERVIEW_PREP.md) records the current
-design, known limitations, and questions to revisit as features land.
+The three-month roadmap and interview guide are kept locally rather than in Git.
 
 ## Architecture
 
