@@ -13,7 +13,7 @@ int main(int argc, char* argv[]) {
     bool port_seen = false;
     bool aof_seen = false;
     bool fsync_seen = false;
-    bool sync_every_second = false;
+    bool sync_every_second = true;
 
     // Accept --port and --aof in either order, once each.
     for(int i = 1; i < argc; i += 2){

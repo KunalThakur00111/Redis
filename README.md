@@ -67,7 +67,8 @@ By default the server listens on `0.0.0.0:6379`, meaning all IPv4 network
 interfaces. `--port` accepts a number from 1 to 65535.
 Local clients can use `127.0.0.1`; clients on other devices should use this
 Linux machine's network IP address. The server currently has no authentication,
-so only expose the selected port on a network you trust. Stop it with Ctrl+C.
+so only expose the selected port on a network you trust. Ctrl+C exits through
+cleanup and attempts to sync pending AOF writes before the process exits.
 If the selected port is already occupied, stop the process using that port
 before starting this one.
 
@@ -79,14 +80,14 @@ describing each affected key's resulting value and absolute expiry deadline.
 An incomplete final record is discarded on restart. This is a custom format,
 not a Redis-compatible AOF file.
 
-The default `--aof-fsync always` calls `fdatasync` before acknowledging each
-logged write. `--aof-fsync everysec` acknowledges after writing the record
-and syncs pending writes approximately once per second in the event loop.
-That mode reduces per-write latency but can lose recent acknowledged writes
-after an operating-system crash or power failure; its periodic sync can still
-pause the event loop. The log records a whole affected key after a write and
-does not compact old records, so large values and long-running workloads can
-make writes and startup slow.
+The default `--aof-fsync everysec` acknowledges after writing the record
+and syncs pending writes approximately once per second in a background thread.
+It reduces per-write latency but can lose recent acknowledged writes after an
+operating-system crash or power failure. `--aof-fsync always` calls `fdatasync`
+before acknowledging each logged write. A background sync can still delay a
+concurrent write to the same file. The log records a whole affected key after
+a write and does not compact old records, so large values and long-running
+workloads can make writes and startup slow.
 Future mutating commands must be added to the persistence command list. The log
 has no checksum, so corruption inside an otherwise valid record may go undetected.
 

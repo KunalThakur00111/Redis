@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <initializer_list>
 #include <string>
+#include <system_error>
 #include <sys/types.h>
 #include <unistd.h>
 #include <vector>
@@ -112,6 +113,14 @@ bool write_all(int fd, const char* data, std::size_t size, std::string& error) {
     return true;
 }
 
+int sync_file(int fd) {
+    int result;
+    do {
+        result = fdatasync(fd);
+    } while(result < 0 && errno == EINTR);
+    return result;
+}
+
 ssize_t read_up_to(int fd, char* data, std::size_t size) {
     std::size_t received = 0;
     while(received < size){
@@ -170,7 +179,23 @@ bool replay_record(const std::string& record, storage::Database& database,
 }  // namespace
 
 Aof::~Aof() {
+    if(sync_thread_.joinable()){
+        std::string ignored_error;
+        stop_and_sync(ignored_error);
+    }
     if(fd_ >= 0) close(fd_);
+}
+
+bool Aof::stop_and_sync(std::string& error) {
+    if(sync_thread_.joinable()){
+        {
+            std::lock_guard<std::mutex> lock(sync_mutex_);
+            stop_sync_ = true;
+        }
+        sync_cv_.notify_one();
+        sync_thread_.join();
+    }
+    return check_sync_error(error);
 }
 
 bool Aof::open_and_replay(const std::string& path, storage::Database& database,
@@ -224,12 +249,21 @@ bool Aof::open_and_replay(const std::string& path, storage::Database& database,
         error = "AOF seek failed: " + std::string(std::strerror(errno));
         return false;
     }
+    if(sync_policy_ == SyncPolicy::every_second){
+        try {
+            sync_thread_ = std::thread(&Aof::sync_loop, this);// 'this' tells run this function on this particular AOF object.
+        } catch(const std::system_error& failure) {
+            error = "AOF sync worker failed: " + std::string(failure.what());
+            return false;
+        }
+    }
     return true;
 }
 
 bool Aof::append_after_command(const std::vector<std::string>& arguments,
                                const std::string& reply, storage::Database& database,
                                std::string& error) {
+    if(!check_sync_error(error)) return false;
     if(fd_ < 0 || reply.empty() || reply[0] == '-') return true;
     const auto keys = affected_keys(arguments);
     if(keys.empty()) return true;
@@ -246,30 +280,66 @@ bool Aof::append_after_command(const std::vector<std::string>& arguments,
        !write_all(fd_, record.data(), record.size(), error)) return false;
 
     if(sync_policy_ == SyncPolicy::every_second){
-        if(!dirty_){
-            next_sync_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-        }
-        dirty_ = true;
-        return true;
+        {
+            std::lock_guard<std::mutex> lock(sync_mutex_);
+            if(!dirty_){
+                next_sync_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            }
+            dirty_ = true;
+            write_generation_++;
+        }// here '}' unlocks the lock 
+        sync_cv_.notify_one();// wakes the condition variable 
+        return check_sync_error(error);
     }
 
-    if(fdatasync(fd_) < 0){
+    if(sync_file(fd_) < 0){
         error = "AOF sync failed: " + std::string(std::strerror(errno));
         return false;
     }
     return true;
 }
 
-bool Aof::sync_if_due(std::string& error) {
-    if(fd_ < 0 || sync_policy_ != SyncPolicy::every_second || !dirty_ ||
-       std::chrono::steady_clock::now() < next_sync_) return true;
-
-    if(fdatasync(fd_) < 0){
-        error = "AOF sync failed: " + std::string(std::strerror(errno));
+bool Aof::check_sync_error(std::string& error) {
+    std::lock_guard<std::mutex> lock(sync_mutex_);
+    if(!sync_error_.empty()){
+        error = sync_error_;
         return false;
     }
-    dirty_ = false;
     return true;
+}
+
+void Aof::sync_loop() {
+    std::unique_lock<std::mutex> lock(sync_mutex_);// we use unique lock becuase function needs to unlock and lock later.
+    //                                                unique lock provide manual locking and unlocking
+    while(true){
+        if(!dirty_){
+            if(stop_sync_) return;
+            sync_cv_.wait(lock, [this]{ return dirty_ || stop_sync_; }/*lamdda function*/);// put the worker to sleep
+            //                                                                                and this wait() function unlocks the sync mutex
+            //                                                                                and on return reaquire the lock
+            continue;
+        }
+        if(!stop_sync_ && std::chrono::steady_clock::now() < next_sync_){
+            sync_cv_.wait_until(lock, next_sync_);
+            continue;
+        }
+
+        const std::uint64_t syncing_generation = write_generation_;
+        lock.unlock();
+        const int result = sync_file(fd_);
+        const int sync_errno = errno;
+        lock.lock();
+        if(result < 0){ 
+            sync_error_ = "AOF sync failed: " +
+                          std::error_code(sync_errno, std::generic_category()).message();
+            return;
+        }
+        if(write_generation_ == syncing_generation){// checks if inbetween the syncing, is there any records to sync has come or not
+            dirty_ = false;
+        } else {
+            next_sync_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        }
+    }
 }
 
 }  // namespace persistence

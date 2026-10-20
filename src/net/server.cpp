@@ -7,12 +7,15 @@
 
 #include <array>
 #include <arpa/inet.h>
+#include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <fcntl.h>
 #include <iostream>
 #include <netinet/in.h>
+#include <signal.h>
 #include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -24,6 +27,14 @@ namespace {
 
 constexpr std::size_t max_pending_input = 128 * 1024;
 constexpr std::size_t max_pending_output = 128 * 1024;
+
+static_assert(std::atomic<bool>::is_always_lock_free,
+              "SIGINT shutdown needs a lock-free atomic flag");
+std::atomic<bool> stop_requested{false};
+
+void request_stop(int) {
+    stop_requested.store(true, std::memory_order_relaxed);
+}
 
 struct Client {
     int socket;
@@ -59,6 +70,7 @@ bool process_input(Client& client, storage::Database& database,
         if (request.status == protocol::ParseStatus::incomplete) {
             return true;
         }
+
         if (request.status == protocol::ParseStatus::invalid) {
             std::string replyy = "-ERR Protocol error: " + request.error + "\r\n";
             if(replyy.size() > max_pending_output - client.output.size()){
@@ -67,7 +79,7 @@ bool process_input(Client& client, storage::Database& database,
             }
             client.output += replyy;
             client.closed_after_reply = true;
-            return true;
+            return true;// if we return false, then that will immideatly remove this client, that's why return true
         }
 
         std::string reply = commands::execute_command(request.arguments, database);
@@ -77,10 +89,12 @@ bool process_input(Client& client, storage::Database& database,
             aof_failed = true;
             return false;
         }
+
         if (reply.size() > max_pending_output - client.output.size()) {
             std::cerr << "Client output buffer limit reached\n";
             return false;
         }
+
         client.output += reply;
         client.input.erase(0, request.consumed);
     }
@@ -144,11 +158,22 @@ int run_server(std::uint16_t port, const std::string& aof_path,
     storage::Database database;
     persistence::Aof aof(sync_every_second ? persistence::SyncPolicy::every_second
                                             : persistence::SyncPolicy::always);
+
+    stop_requested.store(false, std::memory_order_relaxed);
+    struct sigaction interrupt_action{};
+    interrupt_action.sa_handler = request_stop;
+    if(sigemptyset(&interrupt_action.sa_mask) < 0 ||
+       sigaction(SIGINT, &interrupt_action, nullptr) < 0){
+        std::cerr << "SIGINT handler setup failed: " << errno << '\n';
+        return 1;
+    }
+
     std::string aof_error;
     if(!aof.open_and_replay(aof_path, database, aof_error)){
         std::cerr << aof_error << '\n';
         return 1;
     }
+    if(stop_requested.load(std::memory_order_relaxed)) return 0;
 
     // Create the TCP socket that accepts new clients.
     int listener = socket(AF_INET, SOCK_STREAM, 0);
@@ -205,7 +230,7 @@ int run_server(std::uint16_t port, const std::string& aof_path,
 
     // One epoll_wait() returns readiness for both the listener and clients.
     std::array<epoll_event, 128> ready_events{};
-    while (true) {
+    while (!stop_requested.load(std::memory_order_relaxed)) {
         int ready = epoll_wait(
                   epoll_fd, 
                   ready_events.data(),// a pointer where linux write the data on return; and it is overwrite on every iteration.
@@ -220,13 +245,14 @@ int run_server(std::uint16_t port, const std::string& aof_path,
             exit_status = 1;
             break;
         }
-        if(!aof.sync_if_due(aof_error)){
+        if(!aof.check_sync_error(aof_error)){
             std::cerr << aof_error << '\n';
             exit_status = 1;
             break;
         }
 
         for (int i = 0; i < ready; i++) {
+            if(stop_requested.load(std::memory_order_relaxed)) break;
             if(aof_failed) break;
             const epoll_event& ready_event = ready_events[static_cast<std::size_t>(i)];
             int socket = ready_event.data.fd;
@@ -334,6 +360,10 @@ int run_server(std::uint16_t port, const std::string& aof_path,
     close_clients(clients);
     close(epoll_fd);
     close(listener);
+    if(!aof.stop_and_sync(aof_error)){
+        std::cerr << aof_error << '\n';
+        exit_status = 1;
+    }
     return exit_status;
 }
 

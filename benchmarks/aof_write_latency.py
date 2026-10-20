@@ -96,7 +96,8 @@ def main():
         print("A short everysec run may finish before its first periodic sync.")
         for label, aof_path, extra_args in (
             ("memory", None, ()),
-            ("AOF + fdatasync per write", Path(directory) / "always.aof", ()),
+            ("AOF + fdatasync per write", Path(directory) / "always.aof",
+             ("--aof-fsync", "always")),
             ("AOF + everysec", Path(directory) / "everysec.aof",
              ("--aof-fsync", "everysec"))):
             median_ms, p95_ms, ops_per_second = measure(
