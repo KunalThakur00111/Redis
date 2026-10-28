@@ -245,7 +245,7 @@ bool Aof::open_and_replay(const std::string& path, storage::Database& database,
         if(!replay_record(record, database, error)) return false;
         complete_end += static_cast<off_t>(sizeof(header) + record.size());
     }
-    if(lseek(fd_, 0, SEEK_END) < 0){
+    if(lseek(fd_, 0, SEEK_END) < 0){// puts the file position excatly at the end, ready for future writes 
         error = "AOF seek failed: " + std::string(std::strerror(errno));
         return false;
     }

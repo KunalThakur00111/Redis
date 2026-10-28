@@ -117,7 +117,8 @@ bool send_pending(Client& client) {
     }
     if (sent == 0) {
         std::cerr << "Send returned zero for nonempty output\n";
-    } else {
+    } 
+    else {
         std::cerr << "Send failed: " << errno << '\n';
     }
     return false;
@@ -161,9 +162,10 @@ int run_server(std::uint16_t port, const std::string& aof_path,
 
     stop_requested.store(false, std::memory_order_relaxed);
     struct sigaction interrupt_action{};
-    interrupt_action.sa_handler = request_stop;
+    interrupt_action.sa_handler = request_stop;// We are giving Linux the function to call for SIGINT.
+
     if(sigemptyset(&interrupt_action.sa_mask) < 0 ||
-       sigaction(SIGINT, &interrupt_action, nullptr) < 0){
+       sigaction(SIGINT, &interrupt_action, nullptr) < 0){// tells linux when this process recieves ctrl + c, call request_stop. 
         std::cerr << "SIGINT handler setup failed: " << errno << '\n';
         return 1;
     }
