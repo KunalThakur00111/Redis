@@ -42,27 +42,34 @@ if(BUILD_TESTING)
     target_link_options(aof-sync-test PRIVATE -Wl,--wrap=fdatasync)
     add_test(NAME aof-sync COMMAND aof-sync-test)
 
-    find_package(Python3 COMPONENTS Interpreter)
-    if(Python3_Interpreter_FOUND)
-        add_test(NAME socket-commands
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/socket_commands_test.py
-                $<TARGET_FILE:redis-server>)
-        add_test(NAME aof-restart
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/aof_restart_test.py
-                $<TARGET_FILE:redis-server>)
-        add_test(NAME aof-restart-everysec
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/aof_restart_test.py
-                $<TARGET_FILE:redis-server> --aof-fsync everysec)
-        add_test(NAME aof-restart-always
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/aof_restart_test.py
-                $<TARGET_FILE:redis-server> --aof-fsync always)
-        add_test(NAME aof-sigint
-            COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/aof_sigint_test.py
-                $<TARGET_FILE:redis-server>)
-    endif()
+    add_executable(socket-commands-test tests/socket_commands_test.cpp)
+    add_executable(aof-restart-test tests/aof_restart_test.cpp)
+    add_executable(aof-sigint-test tests/aof_sigint_test.cpp)
+    add_executable(io-threads-test tests/io_threads_test.cpp)
+    add_executable(differential-ping-test tests/differential_ping_test.cpp)
+    add_executable(io-threads-bench benchmarks/io_threads.cpp)
+    foreach(target socket-commands-test aof-restart-test aof-sigint-test io-threads-test
+                   differential-ping-test io-threads-bench)
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
+        target_link_libraries(${target} PRIVATE Threads::Threads)
+    endforeach()
+
+    add_test(NAME socket-commands
+        COMMAND socket-commands-test $<TARGET_FILE:redis-server>)
+    add_test(NAME socket-commands-threaded
+        COMMAND socket-commands-test $<TARGET_FILE:redis-server> --io-threads 4)
+    add_test(NAME aof-restart
+        COMMAND aof-restart-test $<TARGET_FILE:redis-server>)
+    add_test(NAME aof-restart-everysec
+        COMMAND aof-restart-test $<TARGET_FILE:redis-server> --aof-fsync everysec)
+    add_test(NAME aof-restart-always
+        COMMAND aof-restart-test $<TARGET_FILE:redis-server> --aof-fsync always)
+    add_test(NAME aof-sigint
+        COMMAND aof-sigint-test $<TARGET_FILE:redis-server>)
+    add_test(NAME aof-restart-threaded
+        COMMAND aof-restart-test $<TARGET_FILE:redis-server> --io-threads 4)
+    add_test(NAME aof-sigint-threaded
+        COMMAND aof-sigint-test $<TARGET_FILE:redis-server> --io-threads 4)
+    add_test(NAME io-threads
+        COMMAND io-threads-test $<TARGET_FILE:redis-server> --io-threads 4)
 endif()

@@ -1,6 +1,6 @@
 # Redis-compatible server (in progress)
 
-A Linux-only, single-threaded C++17 in-memory server. It accepts RESP arrays of bulk
+A Linux-only C++17 in-memory server. It accepts RESP arrays of bulk
 strings over TCP and currently supports `PING`, `ECHO`, `SET`, `MSET`, `GET`, `DEL`,
 `EXISTS`, `DBSIZE`, `MGET`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`,
 `TTL`, `PTTL`, `PERSIST`, `EXPIRETIME`, `PEXPIRETIME`, `GETDEL`, `INCR`, `DECR`,
@@ -33,10 +33,17 @@ protocol/resp_parser.cpp       commands/command_handler.cpp
                        storage/database.h   protocol/resp_writer.cpp
 ```
 
-The server uses Linux POSIX sockets and a level-triggered `epoll` loop.
+The server uses Linux POSIX sockets and level-triggered `epoll` loops.
 The parser, writer, commands, and database do not use socket types.
-The event loop registers the listener and each client with epoll, then waits
-for readable or writable sockets.
+By default, one event loop registers the listener and each client with epoll,
+then waits for readable or writable sockets. With `--io-threads N` (N from 2
+through 16), the main thread accepts connections and executes commands against
+the one shared database. The other N-1 threads each own an epoll loop and their
+assigned client sockets. Workers parse requests and send replies; bounded
+queues carry batches of up to 64 commands to the main thread and replies back
+to the owning worker. Each worker preserves reply order for its clients. AOF
+logging also remains on the command-execution thread, while its optional
+every-second sync worker is separate from the I/O workers.
 
 Each client has input and output byte buffers. A complete command is parsed,
 run against the one shared database, and encoded into the output buffer.
@@ -61,6 +68,8 @@ cmake --build build
 ./build/redis-server --port 6380 --aof build/data.aof
 # Or sync pending log writes approximately once per second:
 ./build/redis-server --port 6380 --aof build/data.aof --aof-fsync everysec
+# Or use four total I/O threads (one acceptor plus three socket workers):
+./build/redis-server --port 6380 --io-threads 4
 ```
 
 By default the server listens on `0.0.0.0:6379`, meaning all IPv4 network
@@ -106,8 +115,12 @@ To run the parser and real TCP tests:
 ctest --test-dir build --output-on-failure
 ```
 
-The TCP test starts its own server on a temporary port. Python 3 is needed for
-that test; CMake skips it if Python is not found.
+The TCP tests start their own servers on temporary ports. The test clients are
+C++ executables built by CMake; Python is not required for CTest.
+The suite also runs socket, AOF restart, SIGINT, and concurrent-client tests
+with four I/O threads. For a reproducible pipelined PING comparison, run
+`./build/io-threads-bench ./build/redis-server`; it reports throughput
+and pipeline round-trip latency. Results depend on the machine and workload.
 
 ## Optional comparison with Redis 8.2.9
 
@@ -126,7 +139,7 @@ make -C build/reference/redis-8.2.9 -j2
 After building this server with CMake, run:
 
 ```sh
-python3 tests/differential_ping_test.py
+./build/differential-ping-test ./build/redis-server build/reference/redis-8.2.9/src/redis-server
 ```
 
 The differential test is separate from the default `ctest` suite because a
@@ -149,5 +162,5 @@ has 128 KiB pending-input and pending-output limits, enough for one maximum
 bulk string plus RESP framing. The server closes a client that exceeds a
 buffer limit or sends invalid RESP. The loop accepts at most 16 connections
 and performs at most four successful reads per client event before handling
-other ready events. Multithreading and full Redis
-compatibility are future steps.
+other ready events. Parallel command execution and full Redis compatibility
+are future steps.
