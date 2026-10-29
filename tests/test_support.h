@@ -182,6 +182,7 @@ public:
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
     std::uint16_t port() const { return port_; }
+    pid_t pid() const { return pid_; }
 
     int wait_for_exit(int timeout_ms) {
         for(int elapsed = 0; elapsed < timeout_ms; elapsed += 10){

@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <string>
 #include <system_error>
@@ -64,6 +65,12 @@ bool make_nonblocking(int socket) {
 
     return flags >= 0 && fcntl(socket, F_SETFL, flags | O_NONBLOCK /* this just sets the new flag of non blocking while keeping other flags too, that's why OR*/) == 0; 
     // 0 on success and -1 on failure that's why ==0 check
+}
+
+bool enable_tcp_nodelay(int socket) {
+    int enabled = 1;
+    return setsockopt(socket, IPPROTO_TCP, TCP_NODELAY,
+                      &enabled, sizeof(enabled)) == 0;
 }
 
 // EAGAIN and EWOULDBLOCK mean the socket can be retried later.
@@ -659,7 +666,7 @@ int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
                     break;
                 }
                 accepted++;
-                if(!make_nonblocking(connection)){
+                if(!make_nonblocking(connection) || !enable_tcp_nodelay(connection)){
                     close(connection);
                     continue;
                 }
@@ -861,7 +868,7 @@ int run_server(std::uint16_t port, const std::string& aof_path,
                     }
                     accepted++;
 
-                    if (!make_nonblocking(connection)) {
+                    if (!make_nonblocking(connection) || !enable_tcp_nodelay(connection)) {
                         close(connection);
                         continue;
                     }

@@ -34,6 +34,8 @@ protocol/resp_parser.cpp       commands/command_handler.cpp
 ```
 
 The server uses Linux POSIX sockets and level-triggered `epoll` loops.
+Accepted client sockets use `TCP_NODELAY` to avoid delayed small replies when
+large pipelined requests arrive in pieces.
 The parser, writer, commands, and database do not use socket types.
 By default, one event loop registers the listener and each client with epoll,
 then waits for readable or writable sockets. With `--io-threads N` (N from 2
@@ -118,9 +120,19 @@ ctest --test-dir build --output-on-failure
 The TCP tests start their own servers on temporary ports. The test clients are
 C++ executables built by CMake; Python is not required for CTest.
 The suite also runs socket, AOF restart, SIGINT, and concurrent-client tests
-with four I/O threads. For a reproducible pipelined PING comparison, run
-`./build/io-threads-bench ./build/redis-server`; it reports throughput
-and pipeline round-trip latency. Results depend on the machine and workload.
+with four I/O threads. For pipelined PING, GET, SET, and INCR comparisons, run
+`./build/io-threads-bench ./build/redis-server`; it reports throughput,
+pipeline round-trip latency, and main-thread CPU use. Pass an optional value
+size in bytes, such as `./build/io-threads-bench ./build/redis-server 8`,
+and optionally a command name, such as
+`./build/io-threads-bench ./build/redis-server 128 SET`.
+To scan latency for every implemented command with 128-byte keys and values,
+run `./build/command-latency-bench ./build/redis-server 128`. It compares one
+and four I/O threads and reports p50, p95, p99, and the number of pipelines
+taking at least 20 ms for each command and for all commands combined.
+For single-command round trips, run
+`./build/command-latency-bench ./build/redis-server 128 1 400`.
+Results depend on the machine and workload.
 
 ## Optional comparison with Redis 8.2.9
 
