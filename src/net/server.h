@@ -5,5 +5,6 @@
 
 namespace net {
     int run_server(std::uint16_t port, const std::string& aof_path = "",
-                   bool sync_every_second = true, int io_threads = 1);
+                   bool sync_every_second = true, int io_threads = 1,
+                   bool execute_on_workers = false);
 }

@@ -206,7 +206,7 @@ bool drain_eventfd(int fd) {
     }
 }
 
-// Workers send parsed commands to the one thread that owns Database and AOF.
+// In queued mode, workers send parsed commands to the one thread that owns Database and AOF.
 struct ThreadedCommand {
     std::vector<std::string> arguments;
     std::string protocol_error;
@@ -231,6 +231,12 @@ struct RequestQueue {
     std::mutex mutex;// protects pending
     std::deque<ThreadedRequest> pending;
     std::atomic<bool> failed{false};
+};
+
+struct DirectExecution {
+    storage::Database& database;
+    persistence::Aof& aof;
+    std::mutex mutex;
 };
 
 enum class QueueResult { accepted, full, failed };
@@ -263,6 +269,7 @@ struct ThreadedClient {
 class IoWorker {
     std::size_t index_;// its index/number in the worker vector
     RequestQueue& requests_;// refrence to the worker-to-main queue
+    DirectExecution* direct_execution_;
     int epoll_fd_ = -1;// this worker's own epoll watcher
     int wake_fd_ = -1;// this worker's own main-to-worker bell
     std::thread thread_;// the OS thread running this worker
@@ -282,7 +289,7 @@ class IoWorker {
     bool process_input(ThreadedClient& tracked) {
         Client& client = tracked.client;
         while(!client.closed_after_reply){
-            if(in_flight_total_ == max_in_flight_per_worker){
+            if(!direct_execution_ && in_flight_total_ == max_in_flight_per_worker){
                 client.read_paused = true;
                 return true;
             }
@@ -310,14 +317,45 @@ class IoWorker {
             }
             if(request.commands.empty()) return true;
 
-            QueueResult queued = queue_request(requests_, std::move(request));
-            if(queued == QueueResult::failed) return false;
-            if(queued == QueueResult::full){
-                client.read_paused = true;
-                return true;
+            if(direct_execution_){
+                std::string reply;
+                for(auto& command : request.commands){
+                    if(!command.protocol_error.empty()){
+                        reply += command.protocol_error;
+                        break;
+                    }
+                    std::string aof_error;
+                    std::string command_reply;
+                    {
+                        std::lock_guard<std::mutex> lock(direct_execution_->mutex);
+                        command_reply = commands::execute_command(
+                            command.arguments, direct_execution_->database);
+                        if(!direct_execution_->aof.append_after_command(
+                                command.arguments, command_reply,
+                                direct_execution_->database, aof_error)){
+                            std::cerr << aof_error << '\n';
+                            requests_.failed.store(true, std::memory_order_relaxed);
+                            stop_requested.store(true, std::memory_order_relaxed);
+                            return false;
+                        }
+                    }
+                    reply += command_reply;
+                }
+                if(reply.size() > max_pending_output - client.output.size()){
+                    std::cerr << "Client output buffer limit reached\n";
+                    return false;
+                }
+                client.output += reply;
+            } else {
+                QueueResult queued = queue_request(requests_, std::move(request));
+                if(queued == QueueResult::failed) return false;
+                if(queued == QueueResult::full){
+                    client.read_paused = true;
+                    return true;
+                }
+                tracked.in_flight++;
+                in_flight_total_++;
             }
-            tracked.in_flight++;
-            in_flight_total_++;
 
             if(invalid){
                 client.input.clear();
@@ -502,8 +540,8 @@ class IoWorker {
     }
 
 public:
-    IoWorker(std::size_t index, RequestQueue& requests)
-        : index_(index), requests_(requests) {}
+    IoWorker(std::size_t index, RequestQueue& requests, DirectExecution* direct_execution)
+        : index_(index), requests_(requests), direct_execution_(direct_execution) {}
 
     ~IoWorker() {
         if(thread_.joinable()) thread_.join();
@@ -571,11 +609,13 @@ public:
     void join() { if(thread_.joinable()) thread_.join(); }
 };
 
-// The main thread accepts clients, executes queued commands, and routes replies.
+// The main thread accepts clients and, in queued mode, executes commands and routes replies.
 int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
-                      persistence::Aof& aof, std::uint16_t port, int io_threads) {
+                      persistence::Aof& aof, std::uint16_t port, int io_threads,
+                      bool execute_on_workers) {
 
     RequestQueue requests;
+    DirectExecution direct_execution{database, aof, {}};
     requests.wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if(requests.wake_fd < 0){
         std::cerr << "Request wake creation failed: " << errno << '\n';
@@ -594,7 +634,8 @@ int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
     workers.reserve(static_cast<std::size_t>(io_threads - 1));// one is main thread so that's why (io_threads - 1)
     bool started = true;
     for(int i = 1; i < io_threads; i++){
-        auto worker = std::make_unique<IoWorker>(workers.size(), requests);
+        auto worker = std::make_unique<IoWorker>(
+            workers.size(), requests, execute_on_workers ? &direct_execution : nullptr);
         if(!worker->start()){
             started = false;
             break;
@@ -721,7 +762,12 @@ int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
             break;
         }
 
-        database.expire_some(16);
+        if(execute_on_workers){
+            std::lock_guard<std::mutex> lock(direct_execution.mutex);
+            database.expire_some(16);
+        } else {
+            database.expire_some(16);
+        }
     }
 
     stop_requested.store(true, std::memory_order_relaxed);
@@ -738,7 +784,11 @@ int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
 }  // namespace
 
 int run_server(std::uint16_t port, const std::string& aof_path,
-               bool sync_every_second, int io_threads) {
+               bool sync_every_second, int io_threads, bool execute_on_workers) {
+    if(execute_on_workers && io_threads < 2){
+        std::cerr << "Worker execution requires I/O threads\n";
+        return 1;
+    }
     storage::Database database;
     persistence::Aof aof(sync_every_second ? persistence::SyncPolicy::every_second
                                             : persistence::SyncPolicy::always);
@@ -811,7 +861,7 @@ int run_server(std::uint16_t port, const std::string& aof_path,
 
     if(io_threads > 1){
         int exit_status = run_threaded_loop(listener, epoll_fd, database, aof,
-                                             port, io_threads);
+                                             port, io_threads, execute_on_workers);
         close(epoll_fd);
         close(listener);
         if(!aof.stop_and_sync(aof_error)){
@@ -915,12 +965,15 @@ int run_server(std::uint16_t port, const std::string& aof_path,
                             break;
                         }
                         if(client.closed_after_reply) break;
-                    } else if (received == 0) {
+                    } 
+                    else if (received == 0) {
                         client.read_closed = true;
                         break;
-                    } else if (would_block() || errno == EINTR) {
+                    } 
+                    else if (would_block() || errno == EINTR) {
                         break;
-                    } else {
+                    } 
+                    else {
                         std::cerr << "Receive failed: " << errno << '\n';
                         remove = true;
                         break;

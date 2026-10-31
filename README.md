@@ -47,6 +47,13 @@ to the owning worker. Each worker preserves reply order for its clients. AOF
 logging also remains on the command-execution thread, while its optional
 every-second sync worker is separate from the I/O workers.
 
+With `--io-threads N --execution workers`, each I/O worker executes commands
+for its own clients under one shared database and AOF mutex. The main thread
+accepts connections and runs active expiry under the same mutex. This avoids
+the command and reply queue trip, but commands still execute one at a time.
+`--execution main` is the default for the threaded mode; worker execution is
+optional because its latency benefit depends on the workload.
+
 Each client has input and output byte buffers. A complete command is parsed,
 run against the one shared database, and encoded into the output buffer.
 Incomplete commands stay in the input buffer. Replies are sent only when the
@@ -72,6 +79,8 @@ cmake --build build
 ./build/redis-server --port 6380 --aof build/data.aof --aof-fsync everysec
 # Or use four total I/O threads (one acceptor plus three socket workers):
 ./build/redis-server --port 6380 --io-threads 4
+# Or let the socket workers execute commands under one shared lock:
+./build/redis-server --port 6380 --io-threads 4 --execution workers
 ```
 
 By default the server listens on `0.0.0.0:6379`, meaning all IPv4 network

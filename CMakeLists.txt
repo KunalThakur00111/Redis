@@ -59,6 +59,8 @@ if(BUILD_TESTING)
         COMMAND socket-commands-test $<TARGET_FILE:redis-server>)
     add_test(NAME socket-commands-threaded
         COMMAND socket-commands-test $<TARGET_FILE:redis-server> --io-threads 4)
+    add_test(NAME socket-commands-worker-execution
+        COMMAND socket-commands-test $<TARGET_FILE:redis-server> --io-threads 4 --execution workers)
     add_test(NAME aof-restart
         COMMAND aof-restart-test $<TARGET_FILE:redis-server>)
     add_test(NAME aof-restart-everysec
@@ -69,8 +71,12 @@ if(BUILD_TESTING)
         COMMAND aof-sigint-test $<TARGET_FILE:redis-server>)
     add_test(NAME aof-restart-threaded
         COMMAND aof-restart-test $<TARGET_FILE:redis-server> --io-threads 4)
+    add_test(NAME aof-restart-worker-execution
+        COMMAND aof-restart-test $<TARGET_FILE:redis-server> --io-threads 4 --execution workers)
     add_test(NAME aof-sigint-threaded
         COMMAND aof-sigint-test $<TARGET_FILE:redis-server> --io-threads 4)
     add_test(NAME io-threads
         COMMAND io-threads-test $<TARGET_FILE:redis-server> --io-threads 4)
+    add_test(NAME io-threads-worker-execution
+        COMMAND io-threads-test $<TARGET_FILE:redis-server> --io-threads 4 --execution workers)
 endif()
