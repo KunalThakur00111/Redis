@@ -2,18 +2,18 @@
 #include <iostream>
 
 namespace protocol{
-    ParseResult parse_request(const std::string& input){
+    ParseResult parse_request(const std::string& input, std::size_t start){
         ParseResult result;
-        if(input.empty()){
+        if(start >= input.size()){
             return result;
         }
         
-        if(input[0]!='*'){
+        if(input[start]!='*'){
             result.status=ParseStatus::invalid;
             result.error="Expected an array";
             return result;
         }
-        size_t line_end=input.find("\r\n",1);
+        size_t line_end=input.find("\r\n",start+1);
 
         if(line_end == std::string::npos){
             return result;
@@ -21,13 +21,13 @@ namespace protocol{
         // logic
         constexpr std::size_t max_arguments=1024;
         std::size_t argument_count=0;
-        if(line_end==1){
+        if(line_end==start+1){
             result.status=ParseStatus::invalid;
             result.error="Missing array count";
             return result;
         }
 
-        for(std::size_t i=1;i<line_end;i++){
+        for(std::size_t i=start+1;i<line_end;i++){
             char ch=input[i];
             if(ch<'0' || ch>'9'){
                 result.status=ParseStatus::invalid;
@@ -128,7 +128,7 @@ namespace protocol{
             //return result;  // Temporary: content parsing is not implemented yet.
         }
         result.status=ParseStatus::complete;
-        result.consumed=position;
+        result.consumed=position-start;
         return result;
     }
 }

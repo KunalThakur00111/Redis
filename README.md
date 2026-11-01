@@ -37,22 +37,14 @@ The server uses Linux POSIX sockets and level-triggered `epoll` loops.
 Accepted client sockets use `TCP_NODELAY` to avoid delayed small replies when
 large pipelined requests arrive in pieces.
 The parser, writer, commands, and database do not use socket types.
-By default, one event loop registers the listener and each client with epoll,
-then waits for readable or writable sockets. With `--io-threads N` (N from 2
-through 16), the main thread accepts connections and executes commands against
-the one shared database. The other N-1 threads each own an epoll loop and their
-assigned client sockets. Workers parse requests and send replies; bounded
-queues carry batches of up to 64 commands to the main thread and replies back
-to the owning worker. Each worker preserves reply order for its clients. AOF
-logging also remains on the command-execution thread, while its optional
-every-second sync worker is separate from the I/O workers.
-
-With `--io-threads N --execution workers`, each I/O worker executes commands
-for its own clients under one shared database and AOF mutex. The main thread
-accepts connections and runs active expiry under the same mutex. This avoids
-the command and reply queue trip, but commands still execute one at a time.
-`--execution main` is the default for the threaded mode; worker execution is
-optional because its latency benefit depends on the workload.
+By default, the server uses four I/O threads: the main thread accepts connections
+and three workers each own an epoll loop and their assigned client sockets.
+Workers parse requests, execute commands, and send replies. One shared mutex
+protects the database and AOF append, so commands execute one at a time and
+each worker preserves reply order for its clients. The main thread runs active
+expiry under the same mutex. The optional every-second AOF sync worker is
+separate from the I/O workers. Use `--io-threads 1` to run the original single
+epoll loop; `--io-threads N` supports 1 through 16 total I/O threads.
 
 Each client has input and output byte buffers. A complete command is parsed,
 run against the one shared database, and encoded into the output buffer.
@@ -77,10 +69,8 @@ cmake --build build
 ./build/redis-server --port 6380 --aof build/data.aof
 # Or sync pending log writes approximately once per second:
 ./build/redis-server --port 6380 --aof build/data.aof --aof-fsync everysec
-# Or use four total I/O threads (one acceptor plus three socket workers):
-./build/redis-server --port 6380 --io-threads 4
-# Or let the socket workers execute commands under one shared lock:
-./build/redis-server --port 6380 --io-threads 4 --execution workers
+# Or use the single-thread comparison mode:
+./build/redis-server --port 6380 --io-threads 1
 ```
 
 By default the server listens on `0.0.0.0:6379`, meaning all IPv4 network

@@ -19,6 +19,6 @@ namespace protocol {
         std::string error;// explanation when the request is invalid
     };
 
-    ParseResult parse_request(const std::string& input);
+    ParseResult parse_request(const std::string& input, std::size_t start = 0);
 
 }

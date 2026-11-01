@@ -14,10 +14,8 @@ int main(int argc, char* argv[]) {
     bool aof_seen = false;
     bool fsync_seen = false;
     bool io_threads_seen = false;
-    bool execution_seen = false;
     bool sync_every_second = true;
-    int io_threads = 1;
-    bool execute_on_workers = false;
+    int io_threads = 4;
 
     // Accept --port and --aof in either order, once each.
     for(int i = 1; i < argc; i += 2){
@@ -52,26 +50,20 @@ int main(int argc, char* argv[]) {
                requested_threads < 1 || requested_threads > 16) break;
             io_threads = requested_threads;
             io_threads_seen = true;
-        } else if(option == "--execution" && !execution_seen){
-            const std::string_view mode(argv[i + 1]);
-            if(mode != "main" && mode != "workers") break;
-            execute_on_workers = mode == "workers";
-            execution_seen = true;
         } else {
             break;
         }
 
         if(i + 2 == argc){
             if(fsync_seen && !aof_seen) break;
-            if(execute_on_workers && io_threads < 2) break;
             return net::run_server(port, aof_path, sync_every_second,
-                                   io_threads, execute_on_workers);
+                                   io_threads);
         }
     }
 
     if(argc == 1) return net::run_server(port, aof_path);
     std::cerr << "Usage: " << argv[0]
               << " [--port 1-65535] [--aof path] [--aof-fsync always|everysec]"
-              << " [--io-threads 1-16] [--execution main|workers]\n";
+              << " [--io-threads 1-16]\n";
     return 1;
 }

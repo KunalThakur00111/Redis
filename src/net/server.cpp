@@ -52,7 +52,6 @@ struct Client {
     bool read_closed = false;// client have nothing to send, in that case this is used( after clearing output buffer, close socket)
     bool closed_after_reply = false;// client send the invalid arguments, after replying close this socket
     std::uint32_t watched_events = EPOLLIN;
-    bool read_paused = false; // temperory stop reading more bytes from this client
 };
 
 // Put a socket in nonblocking mode so accept/recv/send never wait for data.
@@ -142,7 +141,7 @@ bool send_pending(Client& client) {
 
 // Watch for writes only while a reply is queued, and stop watching reads after EOF.
 bool update_client_events(int epoll_fd, Client& client) {
-    std::uint32_t wanted = (client.read_closed || client.closed_after_reply || client.read_paused) ? 0U : static_cast<std::uint32_t>(EPOLLIN);
+    std::uint32_t wanted = (client.read_closed || client.closed_after_reply) ? 0U : static_cast<std::uint32_t>(EPOLLIN);
     
     if (!client.output.empty()) {
         wanted |= EPOLLOUT;
@@ -179,12 +178,8 @@ void close_clients(const std::unordered_map<int, Client>& clients) {
     }
 }
 
-// "batch" is group of complete commands from one client , put into one message 
-
-constexpr std::size_t max_pending_requests = 256;// at most 256 batches in the shared queue awaiting main thread execution
 constexpr std::size_t max_pending_connections = 256;// at most 256 newly assigned sockets waiting in one worker's connection inbox
-constexpr std::size_t max_in_flight_per_worker = 256;// at most 256 batches sent by one worker but not yet answered.
-constexpr std::size_t max_commands_per_batch = 64;// one request message can carry up to 64 parsed commands.
+constexpr std::size_t max_commands_per_batch = 64;// process up to 64 commands before removing consumed input.
 
 bool notify_eventfd(int fd) {// to wake eventfd
     const std::uint64_t one = 1;
@@ -206,79 +201,22 @@ bool drain_eventfd(int fd) {
     }
 }
 
-// In queued mode, workers send parsed commands to the one thread that owns Database and AOF.
-struct ThreadedCommand {
-    std::vector<std::string> arguments;
-    std::string protocol_error;
-};
-
-struct ThreadedRequest {// basically one batch
-    std::size_t worker_index;
-    int socket;
-    std::uint64_t client_id;
-    std::vector<ThreadedCommand> commands;
-};
-
-struct ThreadedReply {
-    int socket;
-    std::uint64_t client_id;// linux can reuse an integer descriptor after a socket closes.
-    std::string reply;
-};
-
-// The mutex protects the queue, not the database or any client's buffers.
-struct RequestQueue {
-    int wake_fd = -1;// the bell that workers uses to wake main thread
-    std::mutex mutex;// protects pending
-    std::deque<ThreadedRequest> pending;
-    std::atomic<bool> failed{false};
-};
-
 struct DirectExecution {
     storage::Database& database;
     persistence::Aof& aof;
     std::mutex mutex;
-};
-
-enum class QueueResult { accepted, full, failed };
-
-QueueResult queue_request(RequestQueue& queue, ThreadedRequest&& request) {
-    bool wake = false;
-
-    {
-        std::lock_guard<std::mutex> lock(queue.mutex);
-        if(queue.pending.size() == max_pending_requests) return QueueResult::full;
-        wake = queue.pending.empty();// empty to non empty requires wake up
-        queue.pending.push_back(std::move(request));
-    }
-
-    if(wake && !notify_eventfd(queue.wake_fd)){
-        queue.failed.store(true, std::memory_order_relaxed);
-        stop_requested.store(true, std::memory_order_relaxed);
-        return QueueResult::failed;
-    }
-    return QueueResult::accepted;
-}
-
-struct ThreadedClient {
-    Client client;
-    std::uint64_t id;
-    std::size_t in_flight = 0;
+    std::atomic<bool> failed{false};
 };
 
 // After assignment, only this worker thread reads or changes its client sockets.
 class IoWorker {
-    std::size_t index_;// its index/number in the worker vector
-    RequestQueue& requests_;// refrence to the worker-to-main queue
-    DirectExecution* direct_execution_;
+    DirectExecution& direct_execution_;
     int epoll_fd_ = -1;// this worker's own epoll watcher
     int wake_fd_ = -1;// this worker's own main-to-worker bell
     std::thread thread_;// the OS thread running this worker
-    std::mutex inbox_mutex_;// protects it's connection and reply inboxes
+    std::mutex inbox_mutex_;// protects its connection inbox
     std::deque<int> connections_;// new socket assigned by main
-    std::deque<ThreadedReply> replies_;// replies produced by main
-    std::unordered_map<int, ThreadedClient> clients_;// it's currently owned client records
-    std::uint64_t next_client_id_ = 1;// new id for each new connection
-    std::size_t in_flight_total_ = 0;// batches sent by this worker, waiting for replies
+    std::unordered_map<int, Client> clients_;// it's currently owned client records
 
     void remove_client(int socket) {
         epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, socket, nullptr);
@@ -286,82 +224,58 @@ class IoWorker {
         clients_.erase(socket);
     }
 
-    bool process_input(ThreadedClient& tracked) {
-        Client& client = tracked.client;
+    bool process_input(Client& client) {
         while(!client.closed_after_reply){
-            if(!direct_execution_ && in_flight_total_ == max_in_flight_per_worker){
-                client.read_paused = true;
-                return true;
-            }
-
-            ThreadedRequest request{index_, client.socket, tracked.id, {}};
-            std::string remaining = client.input;
             std::size_t consumed = 0;
-            bool invalid = false;
+            std::size_t commands_this_batch = 0;
+            std::string reply;
 
-            while(request.commands.size() < max_commands_per_batch){
-                auto parsed = protocol::parse_request(remaining);
+            while(commands_this_batch < max_commands_per_batch){
+                auto parsed = protocol::parse_request(client.input, consumed);
                 if(parsed.status == protocol::ParseStatus::incomplete) break;
 
                 if(parsed.status == protocol::ParseStatus::invalid){
-                    request.commands.push_back(ThreadedCommand{
-                        {}, "-ERR Protocol error: " + parsed.error + "\r\n"});
-                    invalid = true;
-                    break;
+                    reply += "-ERR Protocol error: " + parsed.error + "\r\n";
+                    if(reply.size() > max_pending_output - client.output.size()){
+                        std::cerr << "Client output buffer limit reached\n";
+                        return false;
+                    }
+                    client.output += reply;
+                    client.input.clear();
+                    client.closed_after_reply = true;
+                    return true;
                 }
 
-                consumed += parsed.consumed;
-                remaining.erase(0, parsed.consumed);
-                request.commands.push_back(ThreadedCommand{
-                    std::move(parsed.arguments), {}});
-            }
-            if(request.commands.empty()) return true;
+                std::string aof_error;
+                std::string command_reply;
+                {
+                    std::lock_guard<std::mutex> lock(direct_execution_.mutex);
+                    command_reply = commands::execute_command(
+                        parsed.arguments, direct_execution_.database);
 
-            if(direct_execution_){
-                std::string reply;
-                for(auto& command : request.commands){
-                    if(!command.protocol_error.empty()){
-                        reply += command.protocol_error;
-                        break;
+                    if(!direct_execution_.aof.append_after_command(
+                            parsed.arguments, command_reply,
+                            direct_execution_.database, aof_error)){
+
+                        std::cerr << aof_error << '\n';
+                        
+                        direct_execution_.failed.store(true, std::memory_order_relaxed);
+                        stop_requested.store(true, std::memory_order_relaxed);
+                        return false;
                     }
-                    std::string aof_error;
-                    std::string command_reply;
-                    {
-                        std::lock_guard<std::mutex> lock(direct_execution_->mutex);
-                        command_reply = commands::execute_command(
-                            command.arguments, direct_execution_->database);
-                        if(!direct_execution_->aof.append_after_command(
-                                command.arguments, command_reply,
-                                direct_execution_->database, aof_error)){
-                            std::cerr << aof_error << '\n';
-                            requests_.failed.store(true, std::memory_order_relaxed);
-                            stop_requested.store(true, std::memory_order_relaxed);
-                            return false;
-                        }
-                    }
-                    reply += command_reply;
                 }
+
+                reply += command_reply;
                 if(reply.size() > max_pending_output - client.output.size()){
                     std::cerr << "Client output buffer limit reached\n";
                     return false;
                 }
-                client.output += reply;
-            } else {
-                QueueResult queued = queue_request(requests_, std::move(request));
-                if(queued == QueueResult::failed) return false;
-                if(queued == QueueResult::full){
-                    client.read_paused = true;
-                    return true;
-                }
-                tracked.in_flight++;
-                in_flight_total_++;
+                consumed += parsed.consumed;
+                commands_this_batch++;
             }
 
-            if(invalid){
-                client.input.clear();
-                client.closed_after_reply = true;
-                return true;
-            }
+            if(consumed == 0) return true;
+            client.output += reply;
             client.input.erase(0, consumed);
         }
         return true;
@@ -370,11 +284,10 @@ class IoWorker {
     bool handle_client_event(int socket, std::uint32_t events) {
         auto it = clients_.find(socket);
         if(it == clients_.end()) return true;
-        ThreadedClient& tracked = it->second;
-        Client& client = tracked.client;
+        Client& client = it->second;
         bool remove = (events & EPOLLERR) != 0;
 
-        if(!remove && !client.read_closed && !client.read_paused &&
+        if(!remove && !client.read_closed &&
            !client.closed_after_reply && (events & (EPOLLIN | EPOLLHUP)) != 0){
 
             int reads_this_turn = 0;
@@ -392,12 +305,12 @@ class IoWorker {
                     }
 
                     client.input.append(buffer, count);
-                    if(!process_input(tracked)){
+                    if(!process_input(client)){
                         remove = true;
                         break;
                     }
 
-                    if(client.read_paused || client.closed_after_reply) break;
+                    if(client.closed_after_reply) break;
                 } 
                 else if(received == 0){
                     client.read_closed = true;
@@ -418,22 +331,20 @@ class IoWorker {
         if(!remove && (events & EPOLLOUT) != 0) remove = !send_pending(client);
 
         if((client.read_closed || client.closed_after_reply) &&
-           client.output.empty() && tracked.in_flight == 0) remove = true;
+           client.output.empty()) remove = true;
 
         if(!remove) remove = !update_client_events(epoll_fd_, client);
 
         if(remove) remove_client(socket);
 
-        return !requests_.failed.load(std::memory_order_relaxed);
+        return !direct_execution_.failed.load(std::memory_order_relaxed);
     }
 
     bool process_inbox() {// main has send something to this worker
         std::deque<int> connections;
-        std::deque<ThreadedReply> replies;
         {
             std::lock_guard<std::mutex> lock(inbox_mutex_);
-            connections.swap(connections_);
-            replies.swap(replies_);// swap moves the worker's pending inbox contents into these local deques.
+            connections.swap(connections_);// swap moves pending connections into the local deque.
             //                      damn!! this makes the locked section very short
         }
 
@@ -446,54 +357,9 @@ class IoWorker {
                 close(socket);
                 continue;
             }
-            clients_.emplace(socket, ThreadedClient{
-                Client{socket, {}, {}, false, false, EPOLLIN, false},
-                next_client_id_++});
-        }
-
-        for(auto& completed : replies){
-            if(in_flight_total_ > 0) in_flight_total_--;
-
-            auto it = clients_.find(completed.socket);
-            if(it == clients_.end() || it->second.id != completed.client_id) continue;
-
-            ThreadedClient& tracked = it->second;
-            Client& client = tracked.client;
-
-            if(tracked.in_flight > 0) tracked.in_flight--;
-
-            if(completed.reply.size() > max_pending_output - client.output.size()){
-                std::cerr << "Client output buffer limit reached\n";
-                remove_client(completed.socket);
-                continue;
-            }
-
-            client.output += completed.reply;
-
-            if((client.read_closed || client.closed_after_reply) &&
-               client.output.empty() && tracked.in_flight == 0){
-                remove_client(completed.socket);
-            } 
-            
-            else if(!update_client_events(epoll_fd_, client)){
-                remove_client(completed.socket);
-            }
+            clients_.emplace(socket, Client{socket, {}, {}, false, false, EPOLLIN});
         }
         return true;
-    }
-
-    void resume_paused_clients() {
-        for(auto it = clients_.begin(); it != clients_.end();){
-            int socket = it->first;
-            ThreadedClient& tracked = it->second;
-            it++;
-            Client& client = tracked.client;
-            if(!client.read_paused) continue;
-            client.read_paused = false;
-            if(!process_input(tracked) || !update_client_events(epoll_fd_, client)){
-                remove_client(socket);
-            }
-        }
     }
 
     void run() {
@@ -507,7 +373,7 @@ class IoWorker {
             if(ready < 0){
                 if(errno == EINTR) continue;
                 std::cerr << "I/O worker epoll wait failed: " << errno << '\n';
-                requests_.failed.store(true, std::memory_order_relaxed);
+                direct_execution_.failed.store(true, std::memory_order_relaxed);
                 stop_requested.store(true, std::memory_order_relaxed);
                 break;
             }
@@ -517,9 +383,9 @@ class IoWorker {
 
                 int socket = ready_events[static_cast<std::size_t>(i)].data.fd;
 
-                if(socket == wake_fd_){// main puts a connection or reply in its inbox
+                if(socket == wake_fd_){// main puts a connection in its inbox
                     if(!drain_eventfd(wake_fd_) || !process_inbox()){
-                        requests_.failed.store(true, std::memory_order_relaxed);
+                        direct_execution_.failed.store(true, std::memory_order_relaxed);
                         stop_requested.store(true, std::memory_order_relaxed);
                         break;
                     }
@@ -532,7 +398,6 @@ class IoWorker {
             }
 
             if(stop_requested.load(std::memory_order_relaxed)) break;
-            resume_paused_clients();
         }
 
         for(const auto& entry : clients_) close(entry.first);
@@ -540,8 +405,8 @@ class IoWorker {
     }
 
 public:
-    IoWorker(std::size_t index, RequestQueue& requests, DirectExecution* direct_execution)
-        : index_(index), requests_(requests), direct_execution_(direct_execution) {}
+    IoWorker(DirectExecution& direct_execution)
+        : direct_execution_(direct_execution) {}
 
     ~IoWorker() {
         if(thread_.joinable()) thread_.join();
@@ -581,61 +446,32 @@ public:
             std::lock_guard<std::mutex> lock(inbox_mutex_);
 
             if(connections_.size() == max_pending_connections) return false;
-            wake = connections_.empty() && replies_.empty();
+            wake = connections_.empty();
             connections_.push_back(socket);
 
         }
         if(wake && !notify_eventfd(wake_fd_)){
-            requests_.failed.store(true, std::memory_order_relaxed);
+            direct_execution_.failed.store(true, std::memory_order_relaxed);
             stop_requested.store(true, std::memory_order_relaxed);
         }
         return true;
-    }
-
-    void add_reply(ThreadedReply&& reply) {
-        bool wake = false;
-        {
-            std::lock_guard<std::mutex> lock(inbox_mutex_);
-            wake = connections_.empty() && replies_.empty();
-            replies_.push_back(std::move(reply));
-        }
-        if(wake && !notify_eventfd(wake_fd_)){
-            requests_.failed.store(true, std::memory_order_relaxed);
-            stop_requested.store(true, std::memory_order_relaxed);
-        }
     }
 
     void wake() { notify_eventfd(wake_fd_); }
     void join() { if(thread_.joinable()) thread_.join(); }
 };
 
-// The main thread accepts clients and, in queued mode, executes commands and routes replies.
+// The main thread accepts clients.
 int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
-                      persistence::Aof& aof, std::uint16_t port, int io_threads,
-                      bool execute_on_workers) {
+                      persistence::Aof& aof, std::uint16_t port, int io_threads) {
 
-    RequestQueue requests;
     DirectExecution direct_execution{database, aof, {}};
-    requests.wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if(requests.wake_fd < 0){
-        std::cerr << "Request wake creation failed: " << errno << '\n';
-        return 1;
-    }
-    epoll_event request_event{};
-    request_event.events = EPOLLIN;
-    request_event.data.fd = requests.wake_fd;
-    if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, requests.wake_fd, &request_event) < 0){
-        std::cerr << "Request wake registration failed: " << errno << '\n';
-        close(requests.wake_fd);
-        return 1;
-    }
 
     std::vector<std::unique_ptr<IoWorker>> workers;
     workers.reserve(static_cast<std::size_t>(io_threads - 1));// one is main thread so that's why (io_threads - 1)
     bool started = true;
     for(int i = 1; i < io_threads; i++){
-        auto worker = std::make_unique<IoWorker>(
-            workers.size(), requests, execute_on_workers ? &direct_execution : nullptr);
+        auto worker = std::make_unique<IoWorker>(direct_execution);
         if(!worker->start()){
             started = false;
             break;
@@ -647,8 +483,6 @@ int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
         stop_requested.store(true, std::memory_order_relaxed);
         for(auto& worker : workers) worker->wake();
         for(auto& worker : workers) worker->join();
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, requests.wake_fd, nullptr);
-        close(requests.wake_fd);
         return 1;
     }
 
@@ -670,7 +504,7 @@ int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
             break;
         }
 
-        if(requests.failed.load(std::memory_order_relaxed)){
+        if(direct_execution.failed.load(std::memory_order_relaxed)){
             exit_status = 1;
             break;
         }
@@ -687,15 +521,6 @@ int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
             if(stop_requested.load(std::memory_order_relaxed)) break;
 
             int socket = ready_events[static_cast<std::size_t>(i)].data.fd;
-
-            if(socket == requests.wake_fd){// main thread have to run command and give reply
-                if(!drain_eventfd(requests.wake_fd)){
-                    std::cerr << "Request wake read failed: " << errno << '\n';
-                    exit_status = 1;
-                    break;
-                }
-                continue;
-            }
 
             if(socket != listener) continue;
             int accepted = 0;
@@ -720,75 +545,27 @@ int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
 
         if(exit_status != 0 || stop_requested.load(std::memory_order_relaxed)) break;
 
-        std::deque<ThreadedRequest> batch;
-        bool was_full = false;
-
-        {
-            std::lock_guard<std::mutex> lock(requests.mutex);
-            was_full = requests.pending.size() == max_pending_requests;
-            batch.swap(requests.pending);
-        }
-
-        for(auto& request : batch){
-            std::string reply;
-            for(auto& command : request.commands){
-                if(!command.protocol_error.empty()){
-                    reply += command.protocol_error;
-                    break;
-                }
-
-                std::string command_reply = commands::execute_command(
-                    command.arguments, database);
-
-                if(!aof.append_after_command(command.arguments, command_reply,
-                                             database, aof_error)){
-                    std::cerr << aof_error << '\n';
-                    exit_status = 1;
-                    break;
-                }
-
-                reply += command_reply;
-            }
-            if(exit_status != 0) break;
-            workers[request.worker_index]->add_reply(
-                ThreadedReply{request.socket, request.client_id, std::move(reply)});
-        }
-
-        if(was_full){
-            for(auto& worker : workers) worker->wake();
-        }
-        if(exit_status != 0 || requests.failed.load(std::memory_order_relaxed)){
+        if(direct_execution.failed.load(std::memory_order_relaxed)){
             exit_status = 1;
             break;
         }
 
-        if(execute_on_workers){
-            std::lock_guard<std::mutex> lock(direct_execution.mutex);
-            database.expire_some(16);
-        } else {
-            database.expire_some(16);
-        }
+        std::lock_guard<std::mutex> lock(direct_execution.mutex);
+        database.expire_some(16);
     }
 
     stop_requested.store(true, std::memory_order_relaxed);
     for(auto& worker : workers) worker->wake();
     for(auto& worker : workers) worker->join();
 
-    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, requests.wake_fd, nullptr);
-    
-    close(requests.wake_fd);
-    if(requests.failed.load(std::memory_order_relaxed)) exit_status = 1;
+    if(direct_execution.failed.load(std::memory_order_relaxed)) exit_status = 1;
     return exit_status;
 }
 
 }  // namespace
 
 int run_server(std::uint16_t port, const std::string& aof_path,
-               bool sync_every_second, int io_threads, bool execute_on_workers) {
-    if(execute_on_workers && io_threads < 2){
-        std::cerr << "Worker execution requires I/O threads\n";
-        return 1;
-    }
+               bool sync_every_second, int io_threads) {
     storage::Database database;
     persistence::Aof aof(sync_every_second ? persistence::SyncPolicy::every_second
                                             : persistence::SyncPolicy::always);
@@ -861,7 +638,7 @@ int run_server(std::uint16_t port, const std::string& aof_path,
 
     if(io_threads > 1){
         int exit_status = run_threaded_loop(listener, epoll_fd, database, aof,
-                                             port, io_threads, execute_on_workers);
+                                             port, io_threads);
         close(epoll_fd);
         close(listener);
         if(!aof.stop_and_sync(aof_error)){

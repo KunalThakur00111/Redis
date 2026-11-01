@@ -30,6 +30,14 @@ int main() {
     assert(pipelined.arguments == complete.arguments);
     assert(pipelined.consumed == request.size());
 
+    auto second = protocol::parse_request(request + request, request.size());
+    assert(second.status == protocol::ParseStatus::complete);
+    assert(second.arguments == complete.arguments);
+    assert(second.consumed == request.size());
+
+    auto missing_second = protocol::parse_request(request, request.size());
+    assert(missing_second.status == protocol::ParseStatus::incomplete);
+
     // Content must be followed by CRLF.
     auto invalid = protocol::parse_request("*1\r\n$4\r\nPINGxx");
 
