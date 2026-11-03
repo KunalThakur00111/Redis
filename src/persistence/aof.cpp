@@ -74,7 +74,7 @@ std::string snapshot_keys(const std::vector<std::string>& keys, storage::Databas
         const auto& entry = found->second;
         if(const auto* value = std::get_if<std::string>(&entry.value)){
             append_command(output, {"SET", key, *value});
-        } 
+        }
         else if(const auto* list = std::get_if<std::deque<std::string>>(&entry.value)){
             for(const auto& element : *list) append_command(output, {"RPUSH", key, element});
         } 

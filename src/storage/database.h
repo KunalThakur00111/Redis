@@ -33,10 +33,9 @@ struct ListPopResult{
     std::vector<std::string> elements;
 };
 
-
 struct Entry{
     std::variant<std::deque<std::string>, std::string, Hash, Set> value;
-    std::optional<std::int64_t> expires_at_ms;
+    std::optional<std::int64_t> expires_at_ms;// store expiry in absolute unix millisecond
 };
 
 struct Database {

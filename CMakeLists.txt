@@ -5,7 +5,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "This server currently supports Linux only")
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -13,6 +13,7 @@ add_executable(redis-server
     src/main.cpp
     src/net/server.cpp
     src/persistence/aof.cpp
+    src/persistence/snapshot.cpp
     src/protocol/resp_parser.cpp
     src/protocol/resp_writer.cpp
     src/commands/command_handler.cpp
@@ -29,6 +30,13 @@ if(BUILD_TESTING)
     )
     target_compile_options(resp-parser-test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME resp-parser COMMAND resp-parser-test)
+
+    add_executable(snapshot-test
+        tests/snapshot_test.cpp
+        src/persistence/snapshot.cpp
+    )
+    target_compile_options(snapshot-test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME snapshot COMMAND snapshot-test)
 
     add_executable(aof-sync-test
         tests/aof_sync_test.cpp

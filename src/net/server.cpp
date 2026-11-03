@@ -391,8 +391,7 @@ class IoWorker {
                     }
                 } 
 
-                else if(!handle_client_event(socket,
-                             ready_events[static_cast<std::size_t>(i)].events)){
+                else if(!handle_client_event(socket, ready_events[static_cast<std::size_t>(i)].events)){
                     break;
                 }
             }
@@ -596,7 +595,7 @@ int run_server(std::uint16_t port, const std::string& aof_path,
     }
     // Allow a quick restart after a previous server instance exits.
     int reuse_address = 1;
-    if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse_address,
+    if (setsockopt(listener, SOL_SOCKET/* it means this is on socket level*/, SO_REUSEADDR, &reuse_address,
                    sizeof(reuse_address)) < 0) {
         std::cerr << "SO_REUSEADDR failed: " << errno << '\n';
         close(listener);
@@ -657,11 +656,11 @@ int run_server(std::uint16_t port, const std::string& aof_path,
     std::array<epoll_event, 128> ready_events{};
     while (!stop_requested.load(std::memory_order_relaxed)) {
         int ready = epoll_wait(
-                  epoll_fd, 
-                  ready_events.data(),// a pointer where linux write the data on return; and it is overwrite on every iteration.
-                  static_cast<int>(ready_events.size()),// max size of data return
-                  100// its argument is a timeout in milliseconds.
-                  );
+                    epoll_fd, 
+                    ready_events.data(),// a pointer where linux write the data on return; and it is overwrite on every iteration.
+                    static_cast<int>(ready_events.size()),// max size of data return
+                    100// its argument is a timeout in milliseconds.
+                );
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
@@ -730,7 +729,7 @@ int run_server(std::uint16_t port, const std::string& aof_path,
                     char buffer[4096];
                     ssize_t received = recv(client.socket, buffer, sizeof(buffer), 0);
                     if (received > 0) {
-                        std::size_t count = static_cast<std::size_t>(received);
+                        auto count = static_cast<std::size_t>(received);
                         if (count > max_pending_input - client.input.size()) {
                             std::cerr << "Client input buffer limit reached\n";
                             remove = true;
@@ -802,7 +801,7 @@ int run_server(std::uint16_t port, const std::string& aof_path,
 
 about eventfd:-
 Why is a bell necessary? Main can be asleep inside epoll wait , waiting for network activity. A worker adding an
-item to a normal Ct* degue does not automatically wake Linux's epoll wait . Writing to an eventfd does,
+item to a normal Ct* deque does not automatically wake Linux's epoll wait . Writing to an eventfd does,
 because main registered that descriptor with epoll.
 
 */
