@@ -1,10 +1,13 @@
 // Check that the optional append-only log restores data after a restart.
 #include "test_support.h"
+#include "../src/persistence/snapshot.h"
+#include "../src/storage/database.h"
 
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <thread>
 
 using namespace std::string_literals;
@@ -30,9 +33,46 @@ int main(int argc, char* argv[]) {
             TEST_CHECK(exchange({"SADD", "members", "x", "y"}) == ":2\r\n");
             TEST_CHECK(exchange({"SET", "short", "gone", "PX", "150"}) == "+OK\r\n");
             TEST_CHECK(exchange({"PEXPIRE", "items", "60000"}) == ":1\r\n");
+            server.interrupt();
         }
 
         auto complete_size = std::filesystem::file_size(aof_path);
+        const std::string snapshot_path = aof_path + ".snapshot";
+        std::string snapshot_bytes;
+        {
+            std::ifstream snapshot_file(snapshot_path, std::ios::binary);
+            TEST_CHECK(static_cast<bool>(snapshot_file));
+            snapshot_bytes.assign(std::istreambuf_iterator<char>{snapshot_file},
+                                  std::istreambuf_iterator<char>{});
+            TEST_CHECK(!snapshot_file.bad());
+            storage::Database snapshot_database;
+            std::uint64_t snapshot_offset = 0;
+            std::string snapshot_error;
+            TEST_CHECK(persistence::decode_snapshot(snapshot_bytes, snapshot_database,
+                                                    snapshot_offset, snapshot_error));
+            TEST_CHECK(snapshot_offset == complete_size);
+            TEST_CHECK(std::get<std::string>(snapshot_database.values.at("text").value) ==
+                       "a\0b"s);
+            TEST_CHECK(snapshot_database.values.count("second") == 0);
+            TEST_CHECK(snapshot_database.values.count("items") == 1);
+            TEST_CHECK(snapshot_database.values.count("profile") == 1);
+            TEST_CHECK(snapshot_database.values.count("members") == 1);
+        }
+        {
+            storage::Database mismatched_database;
+            std::uint64_t offset = 0;
+            std::string error;
+            TEST_CHECK(persistence::decode_snapshot(snapshot_bytes, mismatched_database,
+                                                    offset, error));
+            mismatched_database.values.erase("text");
+            const std::string mismatched = persistence::encode_snapshot(
+                mismatched_database, offset);
+            TEST_CHECK(persistence::save_snapshot_file(snapshot_path, mismatched, error));
+            test::Server server(argv[1], options);
+            TEST_CHECK(test::exchange_request(server.port(), {"GET", "text"}) ==
+                       "$3\r\na\0b\r\n"s);
+            TEST_CHECK(persistence::save_snapshot_file(snapshot_path, snapshot_bytes, error));
+        }
         {
             std::ofstream log(aof_path, std::ios::binary | std::ios::app);
             for(int byte = 0; byte < 8; byte++) log.put(byte == 0 ? 20 : 0);
@@ -40,6 +80,8 @@ int main(int argc, char* argv[]) {
             TEST_CHECK(static_cast<bool>(log));
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        std::filesystem::rename(snapshot_path, snapshot_path + ".saved");
 
         {
             test::Server server(argv[1], options);
@@ -61,10 +103,20 @@ int main(int argc, char* argv[]) {
             TEST_CHECK(exchange({"INCR", "counter"}) == ":1\r\n");
         }
 
+        std::filesystem::rename(snapshot_path + ".saved", snapshot_path);
+        {
+            std::fstream log(aof_path, std::ios::binary | std::ios::in | std::ios::out);
+            TEST_CHECK(static_cast<bool>(log));
+            for(int byte = 0; byte < 8; byte++) log.put(static_cast<char>(0xff));
+            TEST_CHECK(static_cast<bool>(log));
+        }
+
         {
             test::Server server(argv[1], options);
             TEST_CHECK(test::exchange_request(server.port(), {"GET", "counter"}) ==
                        "$1\r\n1\r\n");
+            TEST_CHECK(test::exchange_request(server.port(), {"GET", "text"}) ==
+                       "$3\r\na\0b\r\n"s);
         }
         std::cout << "AOF restart test passed\n";
         return 0;

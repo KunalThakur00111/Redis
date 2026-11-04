@@ -3,11 +3,16 @@
 #include "../storage/database.h"
 
 #include <chrono>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
+#include <fcntl.h>
 #include <string>
 #include <string_view>
+#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -284,6 +289,7 @@ bool decode_snapshot(std::string_view data, storage::Database& database,
         }
         if(inserted.first->second.expires_at_ms) restored.track_expiry(inserted.first->first);
     }
+    
     if(!reader.at_end()){
         error = "Snapshot has trailing data";
         return false;
@@ -293,6 +299,152 @@ bool decode_snapshot(std::string_view data, storage::Database& database,
     database = std::move(restored);
     aof_offset = checkpoint;
     error.clear();
+    return true;
+}
+
+bool save_snapshot_file(const std::string& path, std::string_view data,
+                        std::string& error) {
+
+    /*
+    Save the new snapshot without overwriting the old one while writing.
+
+    First, create a temporary file in the same directory as the final snapshot
+    and write and sync all its bytes. Until then, the old snapshot remains intact.
+
+    rename(temporary, path) atomically changes the final filename to refer to the
+    complete new file. The temporary filename disappears. The old file loses its
+    name and is reclaimed once nothing else has it open.
+
+    The paths passed to rename() already identify the parent directory. We open
+    that directory separately only so fsync(directory_fd) can persist the filename
+    change. fdatasync(fd) persists the new file's contents; fsync(directory_fd)
+    persists the directory entry that names it.
+    */                        
+    std::string temporary = path + ".tmp.XXXXXX";
+
+    int fd = mkstemp(temporary.data());// mkstemp replaces the six X characters with a unique suffix, creates that file, and opens it.
+    //                                    it returns a file descriptor on success, or -1 on failure
+    if(fd < 0){
+        error = "Snapshot temporary file creation failed: " +
+                std::string(std::strerror(errno));
+        return false;
+    }
+
+    std::size_t written = 0;
+    while(written < data.size()){
+        const ssize_t result = write(fd, data.data() + written, data.size() - written);
+        if(result > 0){
+            written += static_cast<std::size_t>(result);
+        } else if(result < 0 && errno == EINTR){
+            continue;
+        } else {
+            const int saved_errno = result == 0 ? EIO : errno;
+            close(fd);
+            unlink(temporary.c_str());
+            error = "Snapshot write failed: " + std::string(std::strerror(saved_errno));
+            return false;
+        }
+    }
+
+    int sync_result;
+    do {
+        sync_result = fdatasync(fd);
+    } while(sync_result < 0 && errno == EINTR);
+
+    if(sync_result < 0){
+        const int saved_errno = errno;
+        close(fd);
+        unlink(temporary.c_str());
+        error = "Snapshot sync failed: " + std::string(std::strerror(saved_errno));
+        return false;
+    }
+
+    if(close(fd) < 0){
+        const int saved_errno = errno;
+        unlink(temporary.c_str());
+        error = "Snapshot close failed: " + std::string(std::strerror(saved_errno));
+        return false;
+    }
+
+    // find the parent directory
+    const std::size_t slash = path.find_last_of('/');// find the last slash in the final filename.
+    const std::string directory = slash == std::string::npos ? "." :
+                                  slash == 0 ? "/" : path.substr(0, slash);
+
+                            
+    // first argument: directory path as a c string
+    // O_RDONLY: open for reading, O_DIRECTORY: require this path to be a directory, O_CLOSEXEC: close if run different program
+    int directory_fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if(directory_fd < 0){
+        const int saved_errno = errno;
+        unlink(temporary.c_str());
+        error = "Snapshot directory open failed: " +
+                std::string(std::strerror(saved_errno));
+        return false;
+    }
+
+    // rename(old_path, new_path)
+    if(rename(temporary.c_str(), path.c_str()) < 0){
+        const int saved_errno = errno;
+        close(directory_fd);
+        unlink(temporary.c_str());
+        error = "Snapshot rename failed: " + std::string(std::strerror(saved_errno));
+        return false;
+    }
+    // after a successful rename , the temperory file name is gone; it's context are now reachable at path.
+
+    if(fsync(directory_fd) < 0){
+        const int saved_errno = errno;
+        close(directory_fd);
+        error = "Snapshot directory sync failed: " +
+                std::string(std::strerror(saved_errno));
+        return false;
+    }
+
+    if(close(directory_fd) < 0){
+        error = "Snapshot directory close failed: " +
+                std::string(std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+bool load_snapshot_file(const std::string& path, std::string& data,
+                        bool& found, std::string& error) {
+
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if(fd < 0){
+        if(errno == ENOENT){
+            found = false;
+            return true;
+        }
+        error = "Snapshot open failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+
+    std::string loaded;
+    char buffer[65536];
+    while(true){
+        const ssize_t result = read(fd, buffer, sizeof(buffer));
+        if(result > 0){
+            loaded.append(buffer, static_cast<std::size_t>(result));
+        } 
+        else if(result == 0){
+            break;
+        } 
+        else if(errno != EINTR){
+            const int saved_errno = errno;
+            close(fd);
+            error = "Snapshot read failed: " + std::string(std::strerror(saved_errno));
+            return false;
+        }
+    }
+    if(close(fd) < 0){
+        error = "Snapshot close failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+    data = std::move(loaded);
+    found = true;
     return true;
 }
 

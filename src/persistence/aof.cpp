@@ -10,6 +10,7 @@
 #include <deque>
 #include <fcntl.h>
 #include <initializer_list>
+#include <limits>
 #include <string>
 #include <system_error>
 #include <sys/types.h>
@@ -36,6 +37,18 @@ void append_command(std::string& output, std::initializer_list<std::string> argu
         output += argument;
         output += "\r\n";
     }
+}
+
+std::string checkpoint_record(std::string_view checksum_bytes) {
+    std::string marker = "MRSNAP:";
+    marker.append(checksum_bytes);
+    std::string record;
+    append_command(record, {"PING", marker});
+    return record;
+}
+
+std::size_t checkpoint_frame_size() {
+    return 8 + checkpoint_record(std::string(4, '\0')).size();
 }
 
 std::vector<std::string> affected_keys(const std::vector<std::string>& arguments) {
@@ -153,9 +166,28 @@ std::uint64_t decode_length(const char header[8]) {
     return length;
 }
 
+bool checkpoint_matches(int fd, std::uint64_t offset, std::string_view checksum_bytes) {
+
+    const std::string expected = checkpoint_record(checksum_bytes);
+
+    const std::size_t frame_size = sizeof(std::uint64_t) + expected.size();
+    if(offset < frame_size) return false;
+
+    if(lseek(fd, static_cast<off_t>(offset - frame_size), SEEK_SET) < 0) return false;
+    char header[8];
+
+    if(read_up_to(fd, header, sizeof(header)) != static_cast<ssize_t>(sizeof(header)) ||
+       decode_length(header) != expected.size()) return false;
+
+    std::string actual(expected.size(), '\0');
+    return read_up_to(fd, actual.data(), actual.size()) ==
+               static_cast<ssize_t>(actual.size()) && actual == expected;
+}
+
 bool replay_record(const std::string& record, storage::Database& database,
                    std::string& error) {
     if(record.empty()){
+
         error = "AOF contains an empty record";
         return false;
     }
@@ -199,15 +231,43 @@ bool Aof::stop_and_sync(std::string& error) {
 }
 
 bool Aof::open_and_replay(const std::string& path, storage::Database& database,
-                          std::string& error) {
+                          std::string& error, std::uint64_t snapshot_offset,
+                          std::string_view snapshot_checksum) {
+
     if(path.empty()) return true;
-    fd_ = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+
+    fd_ = open(path.c_str(), O_RDWR | O_CLOEXEC |
+               (snapshot_checksum.empty() ? O_CREAT : 0), 0600);
+               
     if(fd_ < 0){
         error = "AOF open failed: " + std::string(std::strerror(errno));
         return false;
     }
 
     off_t complete_end = 0;
+    if(!snapshot_checksum.empty()){
+        const off_t end = lseek(fd_, 0, SEEK_END);
+        if(end < 0){
+            error = "AOF seek failed: " + std::string(std::strerror(errno));
+            return false;
+        }
+        if(snapshot_offset > static_cast<std::uint64_t>(end)){
+            error = "AOF ends before the snapshot checkpoint";
+            return false;
+        }
+        if(snapshot_checksum.size() == 4 && snapshot_offset > 0 &&
+           checkpoint_matches(fd_, snapshot_offset, snapshot_checksum)){
+            complete_end = static_cast<off_t>(snapshot_offset);
+        } 
+        else {
+            database = storage::Database{};// if not matches, then it clears the database
+        }
+        if(lseek(fd_, complete_end, SEEK_SET) < 0){// it set the position at the exact complete_end position from the start of file
+            error = "AOF seek failed: " + std::string(std::strerror(errno));
+            return false;
+        }
+    }
+
     while(true){
         char header[8];
         const ssize_t header_size = read_up_to(fd_, header, sizeof(header));
@@ -229,6 +289,7 @@ bool Aof::open_and_replay(const std::string& path, storage::Database& database,
             error = "AOF record length is invalid";
             return false;
         }
+
         std::string record(static_cast<std::size_t>(length), '\0');
         const ssize_t record_size = read_up_to(fd_, record.data(), record.size());
         if(record_size < 0){
@@ -245,14 +306,17 @@ bool Aof::open_and_replay(const std::string& path, storage::Database& database,
         if(!replay_record(record, database, error)) return false;
         complete_end += static_cast<off_t>(sizeof(header) + record.size());
     }
+
     if(lseek(fd_, 0, SEEK_END) < 0){// puts the file position excatly at the end, ready for future writes 
         error = "AOF seek failed: " + std::string(std::strerror(errno));
         return false;
     }
+
     if(sync_policy_ == SyncPolicy::every_second){
         try {
             sync_thread_ = std::thread(&Aof::sync_loop, this);// 'this' tells run this function on this particular AOF object.
-        } catch(const std::system_error& failure) {
+        } 
+        catch(const std::system_error& failure) {
             error = "AOF sync worker failed: " + std::string(failure.what());
             return false;
         }
@@ -263,6 +327,7 @@ bool Aof::open_and_replay(const std::string& path, storage::Database& database,
 bool Aof::append_after_command(const std::vector<std::string>& arguments,
                                const std::string& reply, storage::Database& database,
                                std::string& error) {
+
     if(!check_sync_error(error)) return false;
     if(fd_ < 0 || reply.empty() || reply[0] == '-') return true;
     const auto keys = affected_keys(arguments);
@@ -294,6 +359,59 @@ bool Aof::append_after_command(const std::vector<std::string>& arguments,
 
     if(sync_file(fd_) < 0){
         error = "AOF sync failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+bool Aof::current_offset(std::uint64_t& offset, std::string& error) const {
+    if(fd_ < 0){
+        error = "AOF is not open";
+        return false;
+    }
+
+    // 2nd argument of lseek tells move x bytes(here 0) from the 3rd argument position (which is current here).
+    const off_t position = lseek(fd_, 0, SEEK_CUR);// where is the current position..
+    if(position < 0){
+        error = "AOF position failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+    
+    offset = static_cast<std::uint64_t>(position);
+    return true;
+}
+
+bool Aof::next_snapshot_offset(std::uint64_t& offset, std::string& error) const {
+    std::uint64_t current;
+    if(!current_offset(current, error)) return false;
+    const std::size_t frame_size = checkpoint_frame_size();
+    if(current > std::numeric_limits<std::uint64_t>::max() - frame_size){
+        error = "AOF snapshot checkpoint exceeds the offset limit";
+        return false;
+    }
+    offset = current + frame_size;
+    return true;
+}
+
+bool Aof::append_snapshot_checkpoint(std::string_view snapshot,
+                                     std::uint64_t expected_offset, std::string& error) {
+    if(snapshot.size() < 4){
+        error = "Snapshot checksum is missing";
+        return false;
+    }
+    std::uint64_t next_offset;
+    if(!next_snapshot_offset(next_offset, error)) return false;
+    if(next_offset != expected_offset){
+        error = "AOF changed during snapshot capture";
+        return false;
+    }
+    const std::string record = checkpoint_record(snapshot.substr(snapshot.size() - 4));
+    char header[8];
+    encode_length(header, record.size());
+    if(!write_all(fd_, header, sizeof(header), error) ||
+       !write_all(fd_, record.data(), record.size(), error)) return false;
+    if(sync_file(fd_) < 0){
+        error = "AOF checkpoint sync failed: " + std::string(std::strerror(errno));
         return false;
     }
     return true;

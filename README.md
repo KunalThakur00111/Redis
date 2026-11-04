@@ -98,6 +98,12 @@ before acknowledging each logged write. A background sync can still delay a
 concurrent write to the same file. The log records a whole affected key after
 a write and does not compact old records, so large values and long-running
 workloads can make writes and startup slow.
+On a clean shutdown with `--aof`, the server also writes a snapshot to
+`<aof path>.snapshot`. Startup loads a valid snapshot, verifies its checkpoint
+record in the AOF, and replays only later records. If the snapshot is missing,
+invalid, or its checkpoint record does not match, startup replays the full AOF.
+Startup fails if the AOF ends before a valid snapshot's saved checkpoint. The AOF is
+not compacted yet, and snapshots are currently written only on clean shutdown.
 Future mutating commands must be added to the persistence command list. The log
 has no checksum, so corruption inside an otherwise valid record may go undetected.
 

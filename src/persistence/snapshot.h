@@ -16,6 +16,11 @@ std::string encode_snapshot(const storage::Database& database, std::uint64_t aof
 bool decode_snapshot(std::string_view data, storage::Database& database,
                      std::uint64_t& aof_offset, std::string& error);
 
+bool save_snapshot_file(const std::string& path, std::string_view data,
+                        std::string& error);
+bool load_snapshot_file(const std::string& path, std::string& data,
+                        bool& found, std::string& error);
+
 }
 // encoder says:- how do i turn by database into bytes
 // decoder says:- how do i rebuild my database from those bytes?

@@ -2,6 +2,7 @@
 
 #include "../commands/command_handler.h"
 #include "../persistence/aof.h"
+#include "../persistence/snapshot.h"
 #include "../protocol/resp_parser.h"
 #include "../storage/database.h"
 
@@ -561,13 +562,30 @@ int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
     return exit_status;
 }
 
+bool save_shutdown_snapshot(const std::string& aof_path, storage::Database& database,
+                            persistence::Aof& aof, std::string& error) {
+
+    // aof_path: the user’s AOF filename, such as build/data.aof.                            
+    if(aof_path.empty()) return true;// if the server started without --aof, this steps does nothing. it return success becuase there
+    //                                  is no AOF and this optional snapshot operation is not enabled.
+
+    std::uint64_t aof_offset;
+    if(!aof.next_snapshot_offset(aof_offset, error)) return false;
+    
+    const std::string data = persistence::encode_snapshot(database, aof_offset);
+    if(!aof.append_snapshot_checkpoint(data, aof_offset, error)) return false;
+    return persistence::save_snapshot_file(aof_path + ".snapshot", data, error);
+}
+
 }  // namespace
 
 int run_server(std::uint16_t port, const std::string& aof_path,
                bool sync_every_second, int io_threads) {
+
     storage::Database database;
     persistence::Aof aof(sync_every_second ? persistence::SyncPolicy::every_second
                                             : persistence::SyncPolicy::always);
+
 
     stop_requested.store(false, std::memory_order_relaxed);
     struct sigaction interrupt_action{};
@@ -580,7 +598,33 @@ int run_server(std::uint16_t port, const std::string& aof_path,
     }
 
     std::string aof_error;
-    if(!aof.open_and_replay(aof_path, database, aof_error)){
+    std::string snapshot_data;
+    std::uint64_t snapshot_offset = 0;
+    if(!aof_path.empty()){
+        bool snapshot_found = false;
+        if(!persistence::load_snapshot_file(aof_path + ".snapshot", snapshot_data,
+                                            snapshot_found, aof_error)){
+            std::cerr << aof_error << '\n';
+            return 1;
+        }
+        if(snapshot_found){
+            storage::Database restored;
+            if(persistence::decode_snapshot(snapshot_data, restored,
+                                             snapshot_offset, aof_error)){
+                database = std::move(restored);
+            } 
+            else {
+                std::cerr << "Snapshot ignored: " << aof_error << '\n';
+                snapshot_data.clear();
+            }
+        }
+    }
+
+    const std::string snapshot_checksum = snapshot_data.empty() ? "" :
+        snapshot_data.substr(snapshot_data.size() - 4);// the final four bytes of a valid snapshot are it's checksum
+
+    if(!aof.open_and_replay(aof_path, database, aof_error,
+                            snapshot_offset, snapshot_checksum)){
         std::cerr << aof_error << '\n';
         return 1;
     }
@@ -641,6 +685,10 @@ int run_server(std::uint16_t port, const std::string& aof_path,
         close(epoll_fd);
         close(listener);
         if(!aof.stop_and_sync(aof_error)){
+            std::cerr << aof_error << '\n';
+            exit_status = 1;
+        }
+        if(exit_status == 0 && !save_shutdown_snapshot(aof_path, database, aof, aof_error)){
             std::cerr << aof_error << '\n';
             exit_status = 1;
         }
@@ -788,6 +836,10 @@ int run_server(std::uint16_t port, const std::string& aof_path,
     close(epoll_fd);
     close(listener);
     if(!aof.stop_and_sync(aof_error)){
+        std::cerr << aof_error << '\n';
+        exit_status = 1;
+    }
+    if(exit_status == 0 && !save_shutdown_snapshot(aof_path, database, aof, aof_error)){
         std::cerr << aof_error << '\n';
         exit_status = 1;
     }

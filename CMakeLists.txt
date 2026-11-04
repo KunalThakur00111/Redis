@@ -51,7 +51,10 @@ if(BUILD_TESTING)
     add_test(NAME aof-sync COMMAND aof-sync-test)
 
     add_executable(socket-commands-test tests/socket_commands_test.cpp)
-    add_executable(aof-restart-test tests/aof_restart_test.cpp)
+    add_executable(aof-restart-test
+        tests/aof_restart_test.cpp
+        src/persistence/snapshot.cpp
+    )
     add_executable(aof-sigint-test tests/aof_sigint_test.cpp)
     add_executable(io-threads-test tests/io_threads_test.cpp)
     add_executable(differential-ping-test tests/differential_ping_test.cpp)

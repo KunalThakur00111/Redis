@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -43,10 +44,19 @@ class Aof {
         Aof& operator=(const Aof&) = delete;
 
         bool open_and_replay(const std::string& path, storage::Database& database,
-                            std::string& error);
+                            std::string& error, std::uint64_t snapshot_offset = 0,
+                            std::string_view snapshot_checksum = {});
+                            
         bool append_after_command(const std::vector<std::string>& arguments,
                                 const std::string& reply, storage::Database& database,
                                 std::string& error);
+
+        bool current_offset(std::uint64_t& offset, std::string& error) const;
+        bool next_snapshot_offset(std::uint64_t& offset, std::string& error) const;
+
+        bool append_snapshot_checkpoint(std::string_view snapshot,
+                                        std::uint64_t expected_offset, std::string& error);
+
         bool check_sync_error(std::string& error);
         bool stop_and_sync(std::string& error);
 
