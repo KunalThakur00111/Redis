@@ -23,6 +23,7 @@
 #include <cctype>
 #include <deque>
 #include <random>
+#include <unordered_set>
 
 namespace commands {
 namespace {
@@ -267,10 +268,54 @@ std::mt19937_64& random_engine() {
     return engine;
 }
 
-// Choose `take` distinct members at random: shuffle just the first take slots.
-std::vector<std::string> random_distinct(const storage::Set& set, std::size_t take) {
+/*
+One random member of a non-empty set in expected O(1), without copying it.
+Pick a random bucket, retry while it is empty, then a random element within it.
+Like Redis's dictGetFairRandomKey shortcut, members sharing a crowded bucket are
+slightly less likely than others; buckets hold about one element, so the bias is small.
+
+std::unordered_set never shrinks its bucket array when members are removed, so
+after many SPOPs most buckets would be empty and the retries would grow. When
+buckets outnumber members eight to one, rehash(0) shrinks the table to fit.
+That O(N) rehash happens only after the set has shrunk by a large factor, so
+its cost spread over those removals is O(1) each. Rehashing moves no members:
+references to them stay valid, and the set's contents do not change.
+*/
+const std::string& random_member(storage::Set& set) {
+    if(set.size() * 8 < set.bucket_count()) set.rehash(0);
+    std::uniform_int_distribution<std::size_t> bucket_pick(0, set.bucket_count() - 1);
+    while(true){
+        const std::size_t bucket = bucket_pick(random_engine());
+        const std::size_t size = set.bucket_size(bucket);
+        if(size == 0) continue;
+        std::uniform_int_distribution<std::size_t> element_pick(0, size - 1);
+        auto member = set.begin(bucket);
+        std::advance(member, static_cast<std::ptrdiff_t>(element_pick(random_engine())));
+        return *member;
+    }
+}
+
+// Choose `take` distinct members at random.
+std::vector<std::string> random_distinct(storage::Set& set, std::size_t take) {
+    if(take >= set.size()) return std::vector<std::string>(set.begin(), set.end());
+
+    // A small share of the set: draw single members until enough distinct ones
+    // are found. With take at most a third of the set, each draw is new with
+    // probability at least 2/3, so this needs under 1.5 * take draws on average.
+    if(take * 3 <= set.size()){
+        std::unordered_set<std::string> chosen;
+        std::vector<std::string> result;
+        result.reserve(take);
+        while(result.size() < take){
+            const std::string& member = random_member(set);
+            if(chosen.insert(member).second) result.push_back(member);
+        }
+        return result;
+    }
+
+    // A large share: copying is no worse than the reply itself. Shuffle only
+    // the first take slots (a partial Fisher-Yates shuffle).
     std::vector<std::string> members(set.begin(), set.end());
-    if(take > members.size()) take = members.size();
     for(std::size_t i = 0; i < take; i++){
         std::uniform_int_distribution<std::size_t> pick(i, members.size() - 1);
         std::swap(members[i], members[pick(random_engine())]);
@@ -643,7 +688,8 @@ std::string execute_type_command(const std::string& name,
         if(wrong_type) return wrong_type_error;
         if(!set) return count == 3 ? "*0\r\n" : "$-1\r\n";
 
-        auto chosen = random_distinct(*set, static_cast<std::size_t>(
+        auto chosen = count == 2 ? std::vector<std::string>{random_member(*set)}
+                                 : random_distinct(*set, static_cast<std::size_t>(
             std::min<std::uint64_t>(static_cast<std::uint64_t>(requested), set->size())));
         for(const auto& member : chosen) set->erase(member);
         erase_if_empty(database, arguments[1], *set);
@@ -659,11 +705,12 @@ std::string execute_type_command(const std::string& name,
             if(!parse_integer(arguments[2], requested)) return not_integer_error;
             if(requested == std::numeric_limits<std::int64_t>::min()) return "-ERR value is out of range\r\n";
         }
-        const storage::Set* set = find_value<storage::Set>(database, arguments[1], wrong_type);
+        // Not const: picking a member may shrink the set's bucket array.
+        storage::Set* set = find_value<storage::Set>(database, arguments[1], wrong_type);
         if(wrong_type) return wrong_type_error;
         if(!set) return count == 3 ? "*0\r\n" : "$-1\r\n";
 
-        if(count == 2) return protocol::encode_bulk_string(random_distinct(*set, 1)[0]);
+        if(count == 2) return protocol::encode_bulk_string(random_member(*set));
         if(requested >= 0){
             return encode_bulk_strings(random_distinct(*set, static_cast<std::size_t>(
                 std::min<std::uint64_t>(static_cast<std::uint64_t>(requested), set->size()))));
@@ -673,11 +720,9 @@ std::string execute_type_command(const std::string& name,
         // it rather than build a huge reply.
         const auto repeats = static_cast<std::uint64_t>(-requested);
         if(repeats > 1'000'000) return "-ERR count is too large for one reply\r\n";
-        const std::vector<std::string> members(set->begin(), set->end());
-        std::uniform_int_distribution<std::size_t> pick(0, members.size() - 1);
         std::vector<std::string> result;
         result.reserve(static_cast<std::size_t>(repeats));
-        for(std::uint64_t i = 0; i < repeats; i++) result.push_back(members[pick(random_engine())]);
+        for(std::uint64_t i = 0; i < repeats; i++) result.push_back(random_member(*set));
         return encode_bulk_strings(result);
     }
 

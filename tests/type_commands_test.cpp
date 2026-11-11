@@ -56,8 +56,8 @@ int main(int argc, char* argv[]) {
             const auto repeated = array_items(run({"SRANDMEMBER", "s", "-50"}));
             TEST_CHECK(repeated.size() == 50);
             for(const auto& item : repeated) TEST_CHECK(members.count(item) == 1);
-            // 50 picks from 5 members that never repeat would be astonishing.
-            TEST_CHECK(std::set<std::string>(repeated.begin(), repeated.end()).size() < 50);
+            // 50 picks must repeat some member; check they are not all the same one.
+            TEST_CHECK(std::set<std::string>(repeated.begin(), repeated.end()).size() >= 2);
             TEST_CHECK(run({"SRANDMEMBER", "s", "-2000000"}) ==
                        "-ERR count is too large for one reply\r\n");
             TEST_CHECK(run({"SCARD", "s"}) == ":5\r\n");
@@ -72,6 +72,43 @@ int main(int argc, char* argv[]) {
             const std::string single = run({"SPOP", "s"});
             TEST_CHECK(single.rfind("$1\r\n", 0) == 0);
             TEST_CHECK(run({"SCARD", "s"}) == ":2\r\n");
+
+            // Every member is reachable by SRANDMEMBER without a count.
+            {
+                std::string pipeline;
+                for(int i = 0; i < 400; i++) pipeline += test::request({"SRANDMEMBER", "s"});
+                const std::string replies = test::exchange(server.port(), pipeline);
+                for(const auto& member : {"a", "b", "c", "d", "e"}){
+                    if(run({"SISMEMBER", "s", member}) == ":1\r\n"){
+                        TEST_CHECK(replies.find("$1\r\n" + std::string(member) + "\r\n") !=
+                                   std::string::npos);
+                    }
+                }
+            }
+
+            // Popping a large set one member at a time returns each member once
+            // and empties it. The set's buckets are shrunk along the way.
+            {
+                constexpr int size = 5000;
+                std::string fill;
+                for(int i = 0; i < size; i++) fill += test::request({"SADD", "big-set", "m" + std::to_string(i)});
+                test::exchange(server.port(), fill);
+                TEST_CHECK(run({"SCARD", "big-set"}) == ":" + std::to_string(size) + "\r\n");
+                std::string pops;
+                for(int i = 0; i < size; i++) pops += test::request({"SPOP", "big-set"});
+                const std::string replies = test::exchange(server.port(), pops);
+                std::set<std::string> seen;
+                std::size_t position = 0;
+                while(position < replies.size()){
+                    TEST_CHECK(replies[position] == '$');
+                    const std::size_t end = replies.find("\r\n", position);
+                    const std::size_t length = std::stoul(replies.substr(position + 1, end - position - 1));
+                    TEST_CHECK(seen.insert(replies.substr(end + 2, length)).second);
+                    position = end + 2 + length + 2;
+                }
+                TEST_CHECK(seen.size() == static_cast<std::size_t>(size));
+                TEST_CHECK(run({"EXISTS", "big-set"}) == ":0\r\n");
+            }
 
             // APPEND stops at the 64 KiB string limit.
             const std::string half(32 * 1024, 'x');
