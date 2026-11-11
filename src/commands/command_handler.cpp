@@ -16,6 +16,13 @@
 #include <algorithm>
 #include <functional>
 #include <utility>
+#include <cerrno>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cctype>
+#include <deque>
+#include <random>
 
 namespace commands {
 namespace {
@@ -81,6 +88,12 @@ constexpr const char* supported_commands[] = {
     "EXPIRETIME", "PEXPIRETIME", "GETDEL", "INCR", "DECR", "INCRBY", "DECRBY",
     "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX",
     "HSET", "HGET", "HDEL", "HLEN", "SADD", "SREM", "SISMEMBER", "SCARD", "SMEMBERS",
+    "APPEND", "STRLEN", "SETNX", "GETSET", "INCRBYFLOAT",
+    "LSET", "LREM", "LTRIM", "LINSERT",
+    "HMSET", "HGETALL", "HMGET", "HKEYS", "HVALS", "HEXISTS", "HSETNX", "HSTRLEN",
+    "HINCRBY", "HINCRBYFLOAT",
+    "SMISMEMBER", "SINTER", "SUNION", "SDIFF", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE",
+    "SPOP", "SRANDMEMBER", "SMOVE",
     "TYPE", "KEYS", "SCAN", "RENAME", "RENAMENX", "FLUSHDB", "FLUSHALL", "SELECT",
     "COMMAND", "INFO", "CONFIG", "SAVE", "BGREWRITEAOF",
 };
@@ -179,6 +192,513 @@ std::string scan_keys(const std::vector<std::string>& arguments, storage::Databa
 
     return "*2\r\n" + protocol::encode_bulk_string(std::to_string(next_cursor)) +
            encode_bulk_strings(keys);
+}
+
+
+using List = std::deque<std::string>;
+
+// Strings longer than one request's bulk-string limit could not be sent back
+// within a client's output limit, so APPEND refuses to build them.
+constexpr std::size_t max_string_size = 64 * 1024;
+
+// The key's value when it is a live key of type T. Missing: nullptr with
+// wrong_type false. Another type: nullptr with wrong_type true.
+template<typename T>
+T* find_value(storage::Database& database, const std::string& key, bool& wrong_type) {
+    wrong_type = false;
+    auto found = database.find_live(key);
+    if(found == database.values.end()) return nullptr;
+    T* value = std::get_if<T>(&found->second.value);
+    wrong_type = value == nullptr;
+    return value;
+}
+
+// Create an empty T at a key the caller has checked is missing.
+template<typename T>
+T& create_value(storage::Database& database, const std::string& key) {
+    auto inserted = database.values.emplace(key, storage::Entry{T{}, std::nullopt});
+    return std::get<T>(inserted.first->second.value);
+}
+
+// Redis never keeps an empty list, hash or set, so the key goes when the last
+// element does.
+template<typename T>
+void erase_if_empty(storage::Database& database, const std::string& key, const T& container) {
+    if(container.empty()) database.erase_live(key);
+}
+
+// Redis's integer rules: optional '-', no '+', no leading zeros, fits in 64 bits.
+bool parse_integer(const std::string& text, std::int64_t& value) {
+    return arithmetic_parse(text) && parse_int64(text, value);
+}
+
+// Redis's float rules for INCRBYFLOAT: the whole text is a number, without
+// leading spaces, and it is neither NaN nor out of range.
+bool parse_float(const std::string& text, long double& value) {
+    if(text.empty() || text.size() > 5000 ||
+       std::isspace(static_cast<unsigned char>(text[0]))) return false;
+    errno = 0;
+    char* end = nullptr;
+    value = std::strtold(text.c_str(), &end);
+    if(end != text.c_str() + text.size()) return false;// also rejects an embedded NUL byte
+    if(std::isnan(value)) return false;
+    if(errno == ERANGE && (std::isinf(value) || value == 0.0L)) return false;
+    return true;
+}
+
+// Format like Redis: 17 decimals, then trailing zeros and a bare '.' removed.
+std::string format_float(long double value) {
+    char buffer[5200];
+    int length = std::snprintf(buffer, sizeof(buffer), "%.17Lf", value);
+    if(length <= 0 || static_cast<std::size_t>(length) >= sizeof(buffer)) return "0";
+    std::string text(buffer, static_cast<std::size_t>(length));
+    if(text.find('.') != std::string::npos){
+        while(text.back() == '0') text.pop_back();
+        if(text.back() == '.') text.pop_back();
+    }
+    if(text == "-0") text = "0";
+    return text;
+}
+
+std::mt19937_64& random_engine() {
+    // Each thread runs commands only while holding the database lock, but a
+    // separate engine per thread keeps this safe without relying on that.
+    thread_local std::mt19937_64 engine{std::random_device{}()};
+    return engine;
+}
+
+// Choose `take` distinct members at random: shuffle just the first take slots.
+std::vector<std::string> random_distinct(const storage::Set& set, std::size_t take) {
+    std::vector<std::string> members(set.begin(), set.end());
+    if(take > members.size()) take = members.size();
+    for(std::size_t i = 0; i < take; i++){
+        std::uniform_int_distribution<std::size_t> pick(i, members.size() - 1);
+        std::swap(members[i], members[pick(random_engine())]);
+    }
+    members.resize(take);
+    return members;
+}
+
+std::string encode_integers(const std::vector<std::int64_t>& values) {
+    std::vector<std::string> encoded;
+    encoded.reserve(values.size());
+    for(std::int64_t value : values) encoded.push_back(protocol::encode_integer(value));
+    return protocol::encode_array(encoded);
+}
+
+// SINTER, SUNION and SDIFF over arguments[first..]. Every key is type-checked
+// before anything is computed, as in Redis; a missing key is an empty set.
+std::optional<storage::Set> combine_sets(const std::string& name,
+                                         const std::vector<std::string>& arguments,
+                                         std::size_t first, storage::Database& database) {
+    std::vector<const storage::Set*> sets;
+    for(std::size_t i = first; i < arguments.size(); i++){
+        bool wrong_type = false;
+        const storage::Set* set = find_value<storage::Set>(database, arguments[i], wrong_type);
+        if(wrong_type) return std::nullopt;
+        sets.push_back(set);// nullptr stands for a missing, empty set
+    }
+
+    storage::Set result;
+    if(name == "SUNION"){
+        for(const auto* set : sets){
+            if(set) result.insert(set->begin(), set->end());
+        }
+    } 
+    else if(name == "SINTER"){
+        // Start from the smallest set; an empty one makes the result empty.
+        const storage::Set* smallest = nullptr;
+        for(const auto* set : sets){
+            if(!set) return storage::Set{};
+            if(!smallest || set->size() < smallest->size()) smallest = set;
+        }
+        for(const auto& member : *smallest){
+            bool everywhere = true;
+            for(const auto* set : sets){
+                if(set != smallest && set->find(member) == set->end()){
+                    everywhere = false;
+                    break;
+                }
+            }
+            if(everywhere) result.insert(member);
+        }
+    } 
+    else {// SDIFF: members of the first set that are in none of the others
+        if(sets[0]){
+            for(const auto& member : *sets[0]){
+                bool elsewhere = false;
+                for(std::size_t i = 1; i < sets.size(); i++){
+                    if(sets[i] && sets[i]->find(member) != sets[i]->end()){
+                        elsewhere = true;
+                        break;
+                    }
+                }
+                if(!elsewhere) result.insert(member);
+            }
+        }
+    }
+    return result;
+}
+
+// Handle the string, list, hash and set commands added after the first set
+// of each type. Returns an empty string when name is none of them.
+std::string execute_type_command(const std::string& name,
+                                 const std::vector<std::string>& arguments,
+                                 storage::Database& database) {
+    const std::size_t count = arguments.size();
+    bool wrong_type = false;
+
+    // ---------- strings ----------
+
+    if(name == "APPEND"){
+        if(count != 3) return wrong_argument_count(name);
+        std::string* value = find_value<std::string>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        const std::size_t current = value ? value->size() : 0;
+        if(current + arguments[2].size() > max_string_size){
+            return "-ERR string exceeds maximum allowed size (proto-max-bulk-len)\r\n";
+        }
+        if(!value){
+            database.set(arguments[1], arguments[2]);
+            return protocol::encode_integer(static_cast<std::int64_t>(arguments[2].size()));
+        }
+        value->append(arguments[2]);// the expiry, if any, stays
+        return protocol::encode_integer(static_cast<std::int64_t>(value->size()));
+    }
+
+    if(name == "STRLEN"){
+        if(count != 2) return wrong_argument_count(name);
+        const std::string* value = find_value<std::string>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        return protocol::encode_integer(value ? static_cast<std::int64_t>(value->size()) : 0);
+    }
+
+    if(name == "SETNX"){
+        if(count != 3) return wrong_argument_count(name);
+        if(database.find_live(arguments[1]) != database.values.end()) return ":0\r\n";
+        database.set(arguments[1], arguments[2]);
+        return ":1\r\n";
+    }
+
+    if(name == "GETSET"){
+        if(count != 3) return wrong_argument_count(name);
+        const std::string* value = find_value<std::string>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        const std::string reply = value ? protocol::encode_bulk_string(*value) : "$-1\r\n";
+        database.set(arguments[1], arguments[2]);// like SET, this clears the expiry
+        return reply;
+    }
+
+    if(name == "INCRBYFLOAT"){
+        if(count != 3) return wrong_argument_count(name);
+        std::string* value = find_value<std::string>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        long double current = 0;
+        long double increment = 0;
+        if((value && !parse_float(*value, current)) || !parse_float(arguments[2], increment)){
+            return "-ERR value is not a valid float\r\n";
+        }
+        const long double result = current + increment;
+        if(std::isnan(result) || std::isinf(result)){
+            return "-ERR increment would produce NaN or Infinity\r\n";
+        }
+        const std::string text = format_float(result);
+        if(value) *value = text;// the expiry, if any, stays
+        else database.set(arguments[1], text);
+        return protocol::encode_bulk_string(text);
+    }
+
+    // ---------- lists ----------
+
+    if(name == "LSET"){
+        if(count != 4) return wrong_argument_count(name);
+        List* list = find_value<List>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        if(!list) return "-ERR no such key\r\n";
+        std::int64_t index = 0;
+        if(!parse_integer(arguments[2], index)) return not_integer_error;
+        const auto length = static_cast<std::int64_t>(list->size());
+        if(index < 0) index += length;
+        if(index < 0 || index >= length) return "-ERR index out of range\r\n";
+        (*list)[static_cast<std::size_t>(index)] = arguments[3];
+        return "+OK\r\n";
+    }
+
+    if(name == "LREM"){
+        if(count != 4) return wrong_argument_count(name);
+        std::int64_t to_remove = 0;
+        if(!parse_integer(arguments[2], to_remove)) return not_integer_error;
+        List* list = find_value<List>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        if(!list) return ":0\r\n";
+
+        // count > 0 removes from the head, count < 0 from the tail, 0 removes all.
+        const std::string& element = arguments[3];
+        const bool from_tail = to_remove < 0;
+        const std::uint64_t limit = to_remove == 0 ? std::numeric_limits<std::uint64_t>::max()
+                                  : from_tail ? 0 - static_cast<std::uint64_t>(to_remove)
+                                              : static_cast<std::uint64_t>(to_remove);
+        std::uint64_t removed = 0;
+        List kept;
+        if(!from_tail){
+            for(auto& item : *list){
+                if(removed < limit && item == element) removed++;
+                else kept.push_back(std::move(item));
+            }
+        } 
+        else {
+            for(auto it = list->rbegin(); it != list->rend(); ++it){
+                if(removed < limit && *it == element) removed++;
+                else kept.push_front(std::move(*it));
+            }
+        }
+        *list = std::move(kept);
+        erase_if_empty(database, arguments[1], *list);
+        return protocol::encode_integer(static_cast<std::int64_t>(removed));
+    }
+
+    if(name == "LTRIM"){
+        if(count != 4) return wrong_argument_count(name);
+        std::int64_t start = 0;
+        std::int64_t stop = 0;
+        if(!parse_integer(arguments[2], start) || !parse_integer(arguments[3], stop)){
+            return not_integer_error;
+        }
+        List* list = find_value<List>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        if(!list) return "+OK\r\n";
+
+        const auto length = static_cast<std::int64_t>(list->size());
+        if(start < 0) start += length;
+        if(stop < 0) stop += length;
+        if(start < 0) start = 0;
+        if(start > stop || start >= length){
+            list->clear();
+        } 
+        else {
+            if(stop >= length) stop = length - 1;
+            list->erase(list->begin() + (stop + 1), list->end());
+            list->erase(list->begin(), list->begin() + start);
+        }
+        erase_if_empty(database, arguments[1], *list);
+        return "+OK\r\n";
+    }
+
+    if(name == "LINSERT"){
+        if(count != 5) return wrong_argument_count(name);
+        const std::string where = uppercase_ascii(arguments[2]);
+        if(where != "BEFORE" && where != "AFTER") return syntax_error;
+        List* list = find_value<List>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        if(!list) return ":0\r\n";
+        auto pivot = std::find(list->begin(), list->end(), arguments[3]);
+        if(pivot == list->end()) return ":-1\r\n";
+        if(where == "AFTER") ++pivot;
+        list->insert(pivot, arguments[4]);
+        return protocol::encode_integer(static_cast<std::int64_t>(list->size()));
+    }
+
+    // ---------- hashes ----------
+
+    if(name == "HMSET"){
+        if(count < 4 || count % 2 != 0) return wrong_argument_count(name);
+        for(std::size_t i = 2; i < count; i += 2){
+            if(!database.hset(arguments[1], arguments[i], arguments[i + 1])) return wrong_type_error;
+        }
+        return "+OK\r\n";
+    }
+
+    if(name == "HSETNX"){
+        if(count != 4) return wrong_argument_count(name);
+        storage::Hash* hash = find_value<storage::Hash>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        if(hash && hash->count(arguments[2])) return ":0\r\n";
+        if(!hash) hash = &create_value<storage::Hash>(database, arguments[1]);
+        hash->emplace(arguments[2], arguments[3]);
+        return ":1\r\n";
+    }
+
+    if(name == "HGETALL" || name == "HKEYS" || name == "HVALS"){
+        if(count != 2) return wrong_argument_count(name);
+        const storage::Hash* hash = find_value<storage::Hash>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        std::vector<std::string> items;
+        if(hash){
+            for(const auto& field : *hash){
+                if(name != "HVALS") items.push_back(field.first);
+                if(name != "HKEYS") items.push_back(field.second);
+            }
+        }
+        return encode_bulk_strings(items);
+    }
+
+    if(name == "HMGET"){
+        if(count < 3) return wrong_argument_count(name);
+        const storage::Hash* hash = find_value<storage::Hash>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        std::vector<std::string> encoded;
+        for(std::size_t i = 2; i < count; i++){
+            auto field = hash ? hash->find(arguments[i]) : storage::Hash::const_iterator{};
+            if(!hash || field == hash->end()) encoded.push_back("$-1\r\n");
+            else encoded.push_back(protocol::encode_bulk_string(field->second));
+        }
+        return protocol::encode_array(encoded);
+    }
+
+    if(name == "HEXISTS" || name == "HSTRLEN"){
+        if(count != 3) return wrong_argument_count(name);
+        const storage::Hash* hash = find_value<storage::Hash>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        if(!hash) return ":0\r\n";
+        auto field = hash->find(arguments[2]);
+        if(field == hash->end()) return ":0\r\n";
+        return protocol::encode_integer(name == "HEXISTS" ? 1 :
+                                        static_cast<std::int64_t>(field->second.size()));
+    }
+
+    if(name == "HINCRBY"){
+        if(count != 4) return wrong_argument_count(name);
+        std::int64_t increment = 0;
+        if(!parse_integer(arguments[3], increment)) return not_integer_error;
+        storage::Hash* hash = find_value<storage::Hash>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+
+        std::int64_t current = 0;
+        auto field = hash ? hash->find(arguments[2]) : storage::Hash::iterator{};
+        if(hash && field != hash->end() && !parse_integer(field->second, current)){
+            return "-ERR hash value is not an integer\r\n";
+        }
+        if((increment > 0 && current > std::numeric_limits<std::int64_t>::max() - increment) ||
+           (increment < 0 && current < std::numeric_limits<std::int64_t>::min() - increment)){
+            return "-ERR increment or decrement would overflow\r\n";
+        }
+        if(!hash) hash = &create_value<storage::Hash>(database, arguments[1]);
+        (*hash)[arguments[2]] = std::to_string(current + increment);
+        return protocol::encode_integer(current + increment);
+    }
+
+    if(name == "HINCRBYFLOAT"){
+        if(count != 4) return wrong_argument_count(name);
+        long double increment = 0;
+        if(!parse_float(arguments[3], increment)) return "-ERR value is not a valid float\r\n";
+        // Unlike INCRBYFLOAT, Redis refuses an infinite increment before looking at the key.
+        if(std::isinf(increment)) return "-ERR value is NaN or Infinity\r\n";
+        storage::Hash* hash = find_value<storage::Hash>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+
+        long double current = 0;
+        auto field = hash ? hash->find(arguments[2]) : storage::Hash::iterator{};
+        if(hash && field != hash->end() && !parse_float(field->second, current)){
+            return "-ERR hash value is not a float\r\n";
+        }
+        const long double result = current + increment;
+        if(std::isnan(result) || std::isinf(result)){
+            return "-ERR increment would produce NaN or Infinity\r\n";
+        }
+        if(!hash) hash = &create_value<storage::Hash>(database, arguments[1]);
+        const std::string text = format_float(result);
+        (*hash)[arguments[2]] = text;
+        return protocol::encode_bulk_string(text);
+    }
+
+    // ---------- sets ----------
+
+    if(name == "SMISMEMBER"){
+        if(count < 3) return wrong_argument_count(name);
+        const storage::Set* set = find_value<storage::Set>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        std::vector<std::int64_t> found;
+        for(std::size_t i = 2; i < count; i++) found.push_back(set && set->count(arguments[i]) ? 1 : 0);
+        return encode_integers(found);
+    }
+
+    if(name == "SINTER" || name == "SUNION" || name == "SDIFF"){
+        if(count < 2) return wrong_argument_count(name);
+        auto result = combine_sets(name, arguments, 1, database);
+        if(!result) return wrong_type_error;
+        return encode_bulk_strings(std::vector<std::string>(result->begin(), result->end()));
+    }
+
+    if(name == "SINTERSTORE" || name == "SUNIONSTORE" || name == "SDIFFSTORE"){
+        if(count < 3) return wrong_argument_count(name);
+        auto result = combine_sets(name.substr(0, name.size() - 5), arguments, 2, database);
+        if(!result) return wrong_type_error;
+        // The destination is replaced whatever it held before, or removed when
+        // the result is empty. It may also be one of the sources.
+        const std::string& destination = arguments[1];
+        const auto size = static_cast<std::int64_t>(result->size());
+        database.erase_live(destination);
+        if(!result->empty()) create_value<storage::Set>(database, destination) = std::move(*result);
+        return protocol::encode_integer(size);
+    }
+
+    if(name == "SPOP"){
+        if(count < 2) return wrong_argument_count(name);
+        if(count > 3) return syntax_error;
+        std::int64_t requested = 1;
+        if(count == 3 && (!parse_integer(arguments[2], requested) || requested < 0)){
+            return "-ERR value is out of range, must be positive\r\n";
+        }
+        storage::Set* set = find_value<storage::Set>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        if(!set) return count == 3 ? "*0\r\n" : "$-1\r\n";
+
+        auto chosen = random_distinct(*set, static_cast<std::size_t>(
+            std::min<std::uint64_t>(static_cast<std::uint64_t>(requested), set->size())));
+        for(const auto& member : chosen) set->erase(member);
+        erase_if_empty(database, arguments[1], *set);
+        if(count == 2) return protocol::encode_bulk_string(chosen[0]);
+        return encode_bulk_strings(chosen);
+    }
+
+    if(name == "SRANDMEMBER"){
+        if(count < 2) return wrong_argument_count(name);
+        if(count > 3) return syntax_error;
+        std::int64_t requested = 1;
+        if(count == 3){
+            if(!parse_integer(arguments[2], requested)) return not_integer_error;
+            if(requested == std::numeric_limits<std::int64_t>::min()) return "-ERR value is out of range\r\n";
+        }
+        const storage::Set* set = find_value<storage::Set>(database, arguments[1], wrong_type);
+        if(wrong_type) return wrong_type_error;
+        if(!set) return count == 3 ? "*0\r\n" : "$-1\r\n";
+
+        if(count == 2) return protocol::encode_bulk_string(random_distinct(*set, 1)[0]);
+        if(requested >= 0){
+            return encode_bulk_strings(random_distinct(*set, static_cast<std::size_t>(
+                std::min<std::uint64_t>(static_cast<std::uint64_t>(requested), set->size()))));
+        }
+        // A negative count may repeat members. Each element needs at least six
+        // reply bytes, so a count this large could never be sent anyway; refuse
+        // it rather than build a huge reply.
+        const auto repeats = static_cast<std::uint64_t>(-requested);
+        if(repeats > 1'000'000) return "-ERR count is too large for one reply\r\n";
+        const std::vector<std::string> members(set->begin(), set->end());
+        std::uniform_int_distribution<std::size_t> pick(0, members.size() - 1);
+        std::vector<std::string> result;
+        result.reserve(static_cast<std::size_t>(repeats));
+        for(std::uint64_t i = 0; i < repeats; i++) result.push_back(members[pick(random_engine())]);
+        return encode_bulk_strings(result);
+    }
+
+    if(name == "SMOVE"){
+        if(count != 4) return wrong_argument_count(name);
+        bool source_wrong = false;
+        bool destination_wrong = false;
+        storage::Set* source = find_value<storage::Set>(database, arguments[1], source_wrong);
+        storage::Set* destination = find_value<storage::Set>(database, arguments[2], destination_wrong);
+        if(source_wrong || destination_wrong) return wrong_type_error;
+        if(!source || !source->count(arguments[3])) return ":0\r\n";
+        if(source == destination) return ":1\r\n";
+
+        source->erase(arguments[3]);
+        erase_if_empty(database, arguments[1], *source);// destination stays valid: a different key
+        if(!destination) destination = &create_value<storage::Set>(database, arguments[2]);
+        destination->insert(arguments[3]);
+        return ":1\r\n";
+    }
+
+    return {};
 }
 
 }  // namespace
@@ -826,6 +1346,9 @@ std::string execute_command(const std::vector<std::string>& arguments,
 
         return protocol::encode_array(encoded_members);
     }
+
+    std::string type_reply = execute_type_command(name, arguments, database);
+    if(!type_reply.empty()) return type_reply;
 
     if(name == "TYPE"){
         if(count != 2) return wrong_argument_count(name);

@@ -64,8 +64,9 @@ std::vector<std::string> affected_keys(const std::vector<std::string>& arguments
     else if(name == "DEL"){
         for(std::size_t i = 1; i < arguments.size(); i++) keys.push_back(arguments[i]);
     } 
-    else if(arguments.size() >= 3 && (name == "RENAME" || name == "RENAMENX")){
-        // Both keys change: the source is removed and the destination replaced.
+    else if(arguments.size() >= 3 && (name == "RENAME" || name == "RENAMENX" ||
+                                      name == "SMOVE")){
+        // Both keys change: the source loses something and the destination gains it.
         keys.push_back(arguments[1]);
         keys.push_back(arguments[2]);
     } 
@@ -76,7 +77,14 @@ std::vector<std::string> affected_keys(const std::vector<std::string>& arguments
                name == "PEXPIREAT" || name == "PERSIST" ||
                name == "LPUSH" || name == "RPUSH" || name == "LPOP" ||
                name == "RPOP" || name == "HSET" || name == "HDEL" ||
-               name == "SADD" || name == "SREM")){
+               name == "SADD" || name == "SREM" ||
+               name == "APPEND" || name == "SETNX" || name == "GETSET" ||
+               name == "INCRBYFLOAT" || name == "LSET" || name == "LREM" ||
+               name == "LTRIM" || name == "LINSERT" || name == "HMSET" ||
+               name == "HSETNX" || name == "HINCRBY" || name == "HINCRBYFLOAT" ||
+               name == "SPOP" ||
+               // For the *STORE commands, arguments[1] is the destination.
+               name == "SINTERSTORE" || name == "SUNIONSTORE" || name == "SDIFFSTORE")){
         keys.push_back(arguments[1]);
     }
     return keys;

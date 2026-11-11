@@ -62,6 +62,7 @@ if(BUILD_TESTING)
 
     add_executable(socket-commands-test tests/socket_commands_test.cpp)
     add_executable(admin-commands-test tests/admin_commands_test.cpp)
+    add_executable(type-commands-test tests/type_commands_test.cpp)
     add_executable(aof-restart-test
         tests/aof_restart_test.cpp
         src/persistence/snapshot.cpp
@@ -74,11 +75,13 @@ if(BUILD_TESTING)
     add_executable(io-threads-test tests/io_threads_test.cpp)
     add_executable(differential-ping-test tests/differential_ping_test.cpp)
     add_executable(differential-admin-test tests/differential_admin_test.cpp)
+    add_executable(differential-types-test tests/differential_types_test.cpp)
     add_executable(io-threads-bench benchmarks/io_threads.cpp)
     add_executable(command-latency-bench benchmarks/command_latency.cpp)
-    foreach(target socket-commands-test admin-commands-test aof-restart-test aof-sigint-test aof-rewrite-test
+    foreach(target socket-commands-test admin-commands-test type-commands-test aof-restart-test aof-sigint-test aof-rewrite-test
                    io-threads-test
-                   differential-ping-test differential-admin-test io-threads-bench command-latency-bench)
+                   differential-ping-test differential-admin-test
+                   differential-types-test io-threads-bench command-latency-bench)
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
         target_link_libraries(${target} PRIVATE Threads::Threads)
     endforeach()
@@ -91,6 +94,10 @@ if(BUILD_TESTING)
         COMMAND admin-commands-test $<TARGET_FILE:redis-server>)
     add_test(NAME admin-commands-single-thread
         COMMAND admin-commands-test $<TARGET_FILE:redis-server> --io-threads 1)
+    add_test(NAME type-commands
+        COMMAND type-commands-test $<TARGET_FILE:redis-server>)
+    add_test(NAME type-commands-single-thread
+        COMMAND type-commands-test $<TARGET_FILE:redis-server> --io-threads 1)
     add_test(NAME aof-restart
         COMMAND aof-restart-test $<TARGET_FILE:redis-server>)
     add_test(NAME aof-restart-everysec

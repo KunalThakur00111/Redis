@@ -6,8 +6,16 @@ strings over TCP and currently supports `PING`, `ECHO`, `SET`, `MSET`, `GET`, `D
 `TTL`, `PTTL`, `PERSIST`, `EXPIRETIME`, `PEXPIRETIME`, `GETDEL`, `INCR`, `DECR`,
 `INCRBY`, `DECRBY`, `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`,
 `LINDEX`, `HSET`, `HGET`, `HDEL`, `HLEN`, `SADD`, `SREM`, `SISMEMBER`,
-`SCARD`, and `SMEMBERS`. With `--aof`, `SAVE` and `BGREWRITEAOF` control
-persistence.
+`SCARD`, and `SMEMBERS`, plus:
+
+- strings: `APPEND`, `STRLEN`, `SETNX`, `GETSET`, `INCRBYFLOAT`
+- lists: `LSET`, `LREM`, `LTRIM`, `LINSERT`
+- hashes: `HSET` with several fields, `HMSET`, `HSETNX`, `HGETALL`, `HKEYS`,
+  `HVALS`, `HMGET`, `HEXISTS`, `HSTRLEN`, `HINCRBY`, `HINCRBYFLOAT`
+- sets: `SMISMEMBER`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`,
+  `SDIFFSTORE`, `SPOP`, `SRANDMEMBER`, `SMOVE`
+
+With `--aof`, `SAVE` and `BGREWRITEAOF` control persistence.
 Admin commands: `TYPE`, `KEYS`, `SCAN` (with `MATCH`, `COUNT` and `TYPE`),
 `RENAME`, `RENAMENX`, `FLUSHDB`, `FLUSHALL`, `SELECT` (database 0 only), `INFO`
 (server, persistence and keyspace sections), `CONFIG GET`, and `COMMAND COUNT`,
@@ -23,6 +31,13 @@ reorder its buckets at any insert. So, as in Redis, every key present for a whol
 scan is returned at least once. Unlike Redis, each `SCAN` call reads every key,
 so a full scan of N keys costs about N × N / COUNT. `INFO` reports
 `redis_version:8.2.9` because that is the compatibility target.
+
+`INCRBYFLOAT` and `HINCRBYFLOAT` use `long double` and print 17 decimals with
+trailing zeros removed, as Redis does. `APPEND` refuses to grow a string past
+64 KiB, the request bulk-string limit, because a longer value could not be sent
+back within a client's 128 KiB output limit. `SRANDMEMBER` with a negative count
+larger than 1,000,000 is refused for the same reason instead of building a reply
+that would be dropped.
 Data is shared between clients. By default it disappears when the process exits;
 the optional append-only log described below restores it on restart.
 
@@ -201,6 +216,9 @@ commands to both servers and prints every reply that differs:
 ```sh
 ./build/differential-admin-test ./build/redis-server build/reference/redis-8.2.9/src/redis-server
 ```
+
+`./build/differential-types-test` does the same for the string, list, hash and
+set commands, including their error replies and the order arguments are checked.
 
 The differential tests are separate from the default `ctest` suite because a
 fresh clone does not contain the reference Redis binary.

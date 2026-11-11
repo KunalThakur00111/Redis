@@ -2,130 +2,14 @@
 // FLUSHDB/FLUSHALL, SELECT, COMMAND, CONFIG, INFO) with Redis Open Source 8.2.9.
 // Both servers receive the same commands in the same order on one connection
 // each. Every mismatch is printed, then the test fails if there was any.
-#include "test_support.h"
+#include "differential_support.h"
 
-#include <algorithm>
-#include <iostream>
-
-namespace {
-
-// Reads whole RESP2 replies from one connection.
-class ReplyReader {
-    int fd_;
-    std::string buffer_;
-
-    void fill() {
-        char chunk[4096];
-        while(true){
-            const ssize_t count = recv(fd_, chunk, sizeof(chunk), 0);
-            if(count > 0){
-                buffer_.append(chunk, static_cast<std::size_t>(count));
-                return;
-            }
-            if(count < 0 && errno == EINTR) continue;
-            throw std::runtime_error("connection closed before full reply");
-        }
-    }
-
-    std::string line(std::size_t& position) {
-        while(buffer_.find("\r\n", position) == std::string::npos) fill();
-        const std::size_t end = buffer_.find("\r\n", position);
-        std::string text = buffer_.substr(position, end - position);
-        position = end + 2;
-        return text;
-    }
-
-    // Parse one value at position, reading more bytes as needed.
-    void value(std::size_t& position) {
-        while(position >= buffer_.size()) fill();
-        const char type = buffer_[position];
-        const std::string header = line(position);
-        if(type == '+' || type == '-' || type == ':') return;
-        const long long length = std::stoll(header.substr(1));
-        if(type == '$'){
-            if(length < 0) return;
-            while(buffer_.size() < position + static_cast<std::size_t>(length) + 2) fill();
-            position += static_cast<std::size_t>(length) + 2;
-            return;
-        }
-        if(type == '*'){
-            for(long long i = 0; i < length; i++) value(position);
-            return;
-        }
-        throw std::runtime_error("unexpected RESP type");
-    }
-
-public:
-    explicit ReplyReader(int fd) : fd_(fd) {}
-
-    std::string next() {
-        std::size_t position = 0;
-        value(position);
-        std::string reply = buffer_.substr(0, position);
-        buffer_.erase(0, position);
-        return reply;
-    }
-};
-
-// Split a flat array of bulk strings into its encoded elements, sort them, and
-// rebuild it, so replies whose order is unspecified (KEYS, SCAN keys) compare equal.
-std::string sorted_array(const std::string& reply) {
-    if(reply.empty() || reply[0] != '*') return reply;
-    std::size_t position = reply.find("\r\n") + 2;
-    std::vector<std::string> elements;
-    while(position < reply.size()){
-        const std::size_t end = reply.find("\r\n", position);
-        const long long length = std::stoll(reply.substr(position + 1, end - position - 1));
-        const std::size_t size = end + 2 - position + (length < 0 ? 0 : static_cast<std::size_t>(length) + 2);
-        elements.push_back(reply.substr(position, size));
-        position += size;
-    }
-    std::sort(elements.begin(), elements.end());
-    std::string rebuilt = reply.substr(0, reply.find("\r\n") + 2);
-    for(const auto& element : elements) rebuilt += element;
-    return rebuilt;
-}
-
-// SCAN replies: keep the cursor, sort the keys.
-std::string sorted_scan(const std::string& reply) {
-    if(reply.rfind("*2\r\n", 0) != 0) return reply;
-    std::size_t position = 4;
-    const std::size_t end = reply.find("\r\n", position);
-    const std::size_t length = std::stoul(reply.substr(position + 1, end - position - 1));
-    position = end + 2 + length + 2;
-    return reply.substr(0, position) + sorted_array(reply.substr(position));
-}
-
-std::string printable(const std::string& text) {
-    std::string result;
-    for(char ch : text){
-        if(ch == '\r') result += "\\r";
-        else if(ch == '\n') result += "\\n";
-        else result += ch;
-    }
-    return result;
-}
-
-enum class Compare { exact, sorted, scan };
-
-struct Case {
-    std::vector<std::string> command;
-    Compare compare = Compare::exact;
-};
-
-}  // namespace
+using differential::Case;
+using differential::Compare;
 
 int main(int argc, char* argv[]) {
     try {
         TEST_CHECK(argc == 3);
-        test::Server ours(argv[1]);
-        test::Server reference(argv[2], {"--bind", "127.0.0.1", "--save", "",
-                                         "--appendonly", "no"});
-        test::Fd our_connection = test::connect_to(ours.port());
-        test::Fd reference_connection = test::connect_to(reference.port());
-        ReplyReader our_replies(our_connection.get());
-        ReplyReader reference_replies(reference_connection.get());
-
         const std::vector<Case> cases{
             {{"FLUSHALL"}},
             {{"SET", "s", "v"}}, {{"RPUSH", "l", "a"}}, {{"HSET", "h", "f", "v"}},
@@ -172,36 +56,7 @@ int main(int argc, char* argv[]) {
 
             {{"INFO", "nosuchsection"}},
         };
-
-        int mismatches = 0;
-        for(const auto& item : cases){
-            std::string payload = "*" + std::to_string(item.command.size()) + "\r\n";
-            for(const auto& argument : item.command){
-                payload += "$" + std::to_string(argument.size()) + "\r\n" + argument + "\r\n";
-            }
-            test::send_all(our_connection.get(), payload);
-            test::send_all(reference_connection.get(), payload);
-            std::string mine = our_replies.next();
-            std::string theirs = reference_replies.next();
-            if(item.compare == Compare::sorted){
-                mine = sorted_array(mine);
-                theirs = sorted_array(theirs);
-            }
-            else if(item.compare == Compare::scan){
-                mine = sorted_scan(mine);
-                theirs = sorted_scan(theirs);
-            }
-            if(mine != theirs){
-                mismatches++;
-                std::string shown;
-                for(const auto& argument : item.command) shown += " " + printable(argument);
-                std::cout << "MISMATCH" << shown << "\n  ours:  " << printable(mine)
-                          << "\n  redis: " << printable(theirs) << "\n";
-            }
-        }
-        std::cout << cases.size() - static_cast<std::size_t>(mismatches) << " of "
-                  << cases.size() << " replies match Redis Open Source 8.2.9\n";
-        return mismatches == 0 ? 0 : 1;
+        return differential::run(argv[1], argv[2], cases, "admin command");
     } catch(const std::exception& error){
         std::cerr << error.what() << '\n';
         return 1;
