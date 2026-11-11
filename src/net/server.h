@@ -4,7 +4,9 @@
 #include <string>
 
 namespace net {
-    constexpr std::uint32_t default_save_seconds = 60;
+    // Off by default: a snapshot currently runs under the database lock, so
+    // every client waits while it is written.
+    constexpr std::uint32_t default_save_seconds = 0;
     constexpr std::uint64_t default_rewrite_min_size = 64ULL * 1024 * 1024;
 
     // With an AOF, a snapshot is saved every save_seconds if anything was

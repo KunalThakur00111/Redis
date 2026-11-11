@@ -155,6 +155,21 @@ int main(int argc, char* argv[]) {
                        "*2\r\n$4\r\nsave\r\n$4\r\nsave\r\n");
         }
 
+        // Startup deletes temporaries left by a crashed rewrite, and nothing else.
+        {
+            test::TemporaryDirectory directory;
+            const std::string aof_path = directory.path() + "/data.aof";
+            const std::vector<std::string> stale{aof_path + ".rewrite.AbC123",
+                                                 aof_path + ".snapshot.tmp.x1y2z3"};
+            const std::vector<std::string> kept{aof_path + ".rewrite.toolong7",
+                                                directory.path() + "/other.aof.rewrite.AbC123"};
+            for(const auto& file : stale) std::ofstream(file) << "partial";
+            for(const auto& file : kept) std::ofstream(file) << "keep";
+            test::Server server(binary, options_for(aof_path, {}));
+            for(const auto& file : stale) TEST_CHECK(!std::filesystem::exists(file));
+            for(const auto& file : kept) TEST_CHECK(std::filesystem::exists(file));
+        }
+
         // A periodic snapshot is saved after a write.
         {
             test::TemporaryDirectory directory;

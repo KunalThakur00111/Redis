@@ -102,8 +102,9 @@ concurrent write to the same file. The log records a whole affected key after
 a write, so large values make each write record large.
 
 A snapshot is written to `<aof path>.snapshot` on a clean shutdown, by `SAVE`,
-and every `--save-seconds` seconds (default 60) if at least one write was
-logged since the last one. Each snapshot also appends a checkpoint record to
+and every `--save-seconds` seconds if at least one write was logged since the
+last one. The periodic snapshot is off by default because it blocks every
+client while it runs (see below). Each snapshot also appends a checkpoint record to
 the AOF. Startup loads a valid snapshot, verifies its checkpoint record in the
 AOF, and replays only later records. If the snapshot is missing, invalid, or its
 checkpoint record does not match, startup replays the full AOF. Startup fails if
@@ -116,7 +117,9 @@ automatically once the AOF is at least `--aof-rewrite-min-size` bytes (default
 64 MiB) and twice its size at startup or after the last rewrite. The files are
 switched so that a crash at any point leaves a state startup can load: the old
 snapshot is removed, then the new AOF is renamed into place, then the new snapshot.
-`--save-seconds 0` and `--aof-rewrite-min-size 0` turn either automatic step off.
+`--save-seconds 0` (the default) and `--aof-rewrite-min-size 0` turn either
+automatic step off. A crash during a rewrite can leave `<aof path>.rewrite.*` and
+`<aof path>.snapshot.tmp.*` files behind; startup deletes them.
 
 Unlike Redis, `SAVE` and `BGREWRITEAOF` run while holding the database lock, so
 every client waits until they finish; `BGREWRITEAOF` replies with Redis's

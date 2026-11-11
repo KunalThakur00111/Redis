@@ -10,6 +10,7 @@
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
+#include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <string>
@@ -110,6 +111,28 @@ std::string snapshot_keys(const std::vector<std::string>& keys, storage::Databas
 
 std::string error_text(const char* what, int number) {
     return std::string(what) + ": " + std::strerror(number);
+}
+
+// A crash during rewrite() leaves the temporary files it was writing. Delete
+// those named exactly like mkstemp() output for this AOF: prefix plus six characters.
+void remove_stale_temporaries(const std::string& aof_path) {
+    namespace fs = std::filesystem;
+    const fs::path path(aof_path);
+    const std::string name = path.filename().string();
+    const std::string prefixes[] = {name + ".rewrite.", name + ".snapshot.tmp."};
+    const fs::path directory = path.has_parent_path() ? path.parent_path() : fs::path(".");
+
+    std::error_code ignored;
+    for(const auto& item : fs::directory_iterator(directory, ignored)){
+        const std::string candidate = item.path().filename().string();
+        for(const auto& prefix : prefixes){
+            if(candidate.size() == prefix.size() + 6 &&
+               candidate.compare(0, prefix.size(), prefix) == 0 &&
+               item.is_regular_file(ignored)){
+                fs::remove(item.path(), ignored);
+            }
+        }
+    }
 }
 
 bool write_all(int fd, const char* data, std::size_t size, std::string& error) {
@@ -252,6 +275,7 @@ bool Aof::open_and_replay(const std::string& path, storage::Database& database,
 
     if(path.empty()) return true;
     path_ = path;
+    remove_stale_temporaries(path);
 
     fd_ = open(path.c_str(), O_RDWR | O_CLOEXEC |
                (snapshot_checksum.empty() ? O_CREAT : 0), 0600);
