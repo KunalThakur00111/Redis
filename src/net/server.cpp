@@ -198,16 +198,28 @@ std::string config_reply(const std::vector<std::string>& arguments, persistence:
         {"maxmemory", "0"},
     };
 
+    // Like Redis, an argument without glob characters names one parameter,
+    // ignoring case, and the reply repeats the name as the client wrote it. A
+    // pattern matches names, ignoring case, and the reply uses the real names.
+    // Each parameter appears once.
+    std::vector<std::string> reply_names(parameters.size());
     std::vector<bool> chosen(parameters.size(), false);
     for(std::size_t i = 2; i < arguments.size(); i++){
+        const std::string& argument = arguments[i];
+        const bool pattern = argument.find_first_of("*?[") != std::string::npos;
         for(std::size_t j = 0; j < parameters.size(); j++){
-            if(commands::glob_match(arguments[i], parameters[j].first, true)) chosen[j] = true;
+            if(chosen[j]) continue;
+            if(pattern ? commands::glob_match(argument, parameters[j].first, true)
+                       : ascii_case(argument, false) == parameters[j].first){
+                chosen[j] = true;
+                reply_names[j] = pattern ? parameters[j].first : argument;
+            }
         }
     }
     std::vector<std::string> encoded;
     for(std::size_t j = 0; j < parameters.size(); j++){
         if(!chosen[j]) continue;
-        encoded.push_back(protocol::encode_bulk_string(parameters[j].first));
+        encoded.push_back(protocol::encode_bulk_string(reply_names[j]));
         encoded.push_back(protocol::encode_bulk_string(parameters[j].second));
     }
     return protocol::encode_array(encoded);

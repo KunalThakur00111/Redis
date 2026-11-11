@@ -73,11 +73,12 @@ if(BUILD_TESTING)
     )
     add_executable(io-threads-test tests/io_threads_test.cpp)
     add_executable(differential-ping-test tests/differential_ping_test.cpp)
+    add_executable(differential-admin-test tests/differential_admin_test.cpp)
     add_executable(io-threads-bench benchmarks/io_threads.cpp)
     add_executable(command-latency-bench benchmarks/command_latency.cpp)
     foreach(target socket-commands-test admin-commands-test aof-restart-test aof-sigint-test aof-rewrite-test
                    io-threads-test
-                   differential-ping-test io-threads-bench command-latency-bench)
+                   differential-ping-test differential-admin-test io-threads-bench command-latency-bench)
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
         target_link_libraries(${target} PRIVATE Threads::Threads)
     endforeach()

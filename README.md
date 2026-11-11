@@ -194,7 +194,15 @@ After building this server with CMake, run:
 ./build/differential-ping-test ./build/redis-server build/reference/redis-8.2.9/src/redis-server
 ```
 
-The differential test is separate from the default `ctest` suite because a
+The same comparison for the admin commands (`TYPE`, `KEYS`, `SCAN`, `RENAME`,
+`FLUSHDB`/`FLUSHALL`, `SELECT`, `COMMAND`, `CONFIG GET`, `INFO`) sends the same
+commands to both servers and prints every reply that differs:
+
+```sh
+./build/differential-admin-test ./build/redis-server build/reference/redis-8.2.9/src/redis-server
+```
+
+The differential tests are separate from the default `ctest` suite because a
 fresh clone does not contain the reference Redis binary.
 
 ## Learning checkpoints

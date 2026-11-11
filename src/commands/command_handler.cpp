@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <optional>
 #include <vector>
 #include <charconv>
@@ -112,7 +113,9 @@ however the map grows or shrinks. The cost: each call reads every key, so a
 full scan costs O(N * N / COUNT) rather than O(N).
 */
 std::string scan_keys(const std::vector<std::string>& arguments, storage::Database& database) {
-    const std::string& cursor_text = arguments[1];
+    // Like Redis, accept an optional leading '+'; from_chars rejects it.
+    std::string_view cursor_text = arguments[1];
+    if(cursor_text.size() > 1 && cursor_text[0] == '+') cursor_text.remove_prefix(1);
     std::uint64_t cursor = 0;
     const auto parsed = std::from_chars(cursor_text.data(),
                                         cursor_text.data() + cursor_text.size(), cursor);
@@ -889,10 +892,9 @@ std::string execute_command(const std::vector<std::string>& arguments,
         // redis-cli asks for COMMAND DOCS when it connects. No documentation is
         // kept here, and an empty reply tells it to go without hints.
         if(subcommand == "DOCS") return "*0\r\n";
-        if(subcommand == "COUNT" || subcommand == "LIST"){
-            return "-ERR wrong number of arguments for 'command|" + lower_ascii(subcommand) +
-                   "' command\r\n";
-        }
+        if(subcommand == "COUNT") return wrong_argument_count("command|count");
+        // Redis's COMMAND LIST takes a FILTERBY clause, which is not supported here.
+        if(subcommand == "LIST") return syntax_error;
         return "-ERR unknown subcommand '" + one_line(arguments[1]) + "'. Try COMMAND HELP.\r\n";
     }
 

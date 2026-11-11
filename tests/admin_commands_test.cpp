@@ -210,7 +210,8 @@ int main(int argc, char* argv[]) {
         TEST_CHECK(exchange({"CONFIG", "GET", "appendonly"}) ==
                    "*2\r\n$10\r\nappendonly\r\n$2\r\nno\r\n");
         TEST_CHECK(exchange({"CONFIG", "GET", "databases", "PORT"}) ==
-                   "*4\r\n$4\r\nport\r\n$" + std::to_string(std::to_string(server.port()).size()) +
+                   // An exact name is echoed as written, as Redis does.
+                   "*4\r\n$4\r\nPORT\r\n$" + std::to_string(std::to_string(server.port()).size()) +
                    "\r\n" + std::to_string(server.port()) + "\r\n$9\r\ndatabases\r\n$1\r\n1\r\n");
         TEST_CHECK(sorted_array(exchange({"CONFIG", "GET", "auto-aof-*"})).size() == 4);
         TEST_CHECK(exchange({"CONFIG", "GET", "nope"}) == "*0\r\n");
