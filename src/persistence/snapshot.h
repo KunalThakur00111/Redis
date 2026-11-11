@@ -18,6 +18,14 @@ bool decode_snapshot(std::string_view data, storage::Database& database,
 
 bool save_snapshot_file(const std::string& path, std::string_view data,
                         std::string& error);
+
+// Write and sync data into a new file named path + ".tmp.XXXXXX". On success
+// temporary_path names it, and the caller renames or unlinks it.
+bool write_temporary_file(const std::string& path, std::string_view data,
+                          std::string& temporary_path, std::string& error);
+
+// Persist a rename or unlink inside path's directory.
+bool sync_parent_directory(const std::string& path, std::string& error);
 bool load_snapshot_file(const std::string& path, std::string& data,
                         bool& found, std::string& error);
 

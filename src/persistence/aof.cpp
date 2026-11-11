@@ -3,6 +3,7 @@
 #include "../commands/command_handler.h"
 #include "../protocol/resp_parser.h"
 #include "../storage/database.h"
+#include "snapshot.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -75,6 +76,25 @@ std::vector<std::string> affected_keys(const std::vector<std::string>& arguments
     return keys;
 }
 
+// Append the commands that recreate one live key, including its absolute expiry.
+void append_entry(std::string& output, const std::string& key, const storage::Entry& entry) {
+    if(const auto* value = std::get_if<std::string>(&entry.value)){
+        append_command(output, {"SET", key, *value});
+    }
+    else if(const auto* list = std::get_if<std::deque<std::string>>(&entry.value)){
+        for(const auto& element : *list) append_command(output, {"RPUSH", key, element});
+    } 
+    else if(const auto* hash = std::get_if<storage::Hash>(&entry.value)){
+        for(const auto& field : *hash) append_command(output, {"HSET", key, field.first, field.second});
+    } 
+    else if(const auto* set = std::get_if<storage::Set>(&entry.value)){
+        for(const auto& member : *set) append_command(output, {"SADD", key, member});
+    }
+    if(entry.expires_at_ms){
+        append_command(output, {"PEXPIREAT", key, std::to_string(*entry.expires_at_ms)});
+    }
+}
+
 std::string snapshot_keys(const std::vector<std::string>& keys, storage::Database& database) {
     std::string output;
     for(const auto& key : keys){
@@ -83,25 +103,13 @@ std::string snapshot_keys(const std::vector<std::string>& keys, storage::Databas
         append_command(output, {"DEL", key});
         auto found = database.find_live(key);
         if(found == database.values.end()) continue;
-
-        const auto& entry = found->second;
-        if(const auto* value = std::get_if<std::string>(&entry.value)){
-            append_command(output, {"SET", key, *value});
-        }
-        else if(const auto* list = std::get_if<std::deque<std::string>>(&entry.value)){
-            for(const auto& element : *list) append_command(output, {"RPUSH", key, element});
-        } 
-        else if(const auto* hash = std::get_if<storage::Hash>(&entry.value)){
-            for(const auto& field : *hash) append_command(output, {"HSET", key, field.first, field.second});
-        } 
-        else if(const auto* set = std::get_if<storage::Set>(&entry.value)){
-            for(const auto& member : *set) append_command(output, {"SADD", key, member});
-        }
-        if(entry.expires_at_ms){
-            append_command(output, {"PEXPIREAT", key, std::to_string(*entry.expires_at_ms)});
-        }
+        append_entry(output, key, found->second);
     }
     return output;
+}
+
+std::string error_text(const char* what, int number) {
+    return std::string(what) + ": " + std::strerror(number);
 }
 
 bool write_all(int fd, const char* data, std::size_t size, std::string& error) {
@@ -164,6 +172,14 @@ std::uint64_t decode_length(const char header[8]) {
         length = (length << 8) | static_cast<unsigned char>(header[i]);
     }
     return length;
+}
+
+// Write one length-prefixed record.
+bool write_frame(int fd, std::string_view record, std::string& error) {
+    char header[8];
+    encode_length(header, record.size());
+    return write_all(fd, header, sizeof(header), error) &&
+           write_all(fd, record.data(), record.size(), error);
 }
 
 bool checkpoint_matches(int fd, std::uint64_t offset, std::string_view checksum_bytes) {
@@ -235,6 +251,7 @@ bool Aof::open_and_replay(const std::string& path, storage::Database& database,
                           std::string_view snapshot_checksum) {
 
     if(path.empty()) return true;
+    path_ = path;
 
     fd_ = open(path.c_str(), O_RDWR | O_CLOEXEC |
                (snapshot_checksum.empty() ? O_CREAT : 0), 0600);
@@ -307,19 +324,28 @@ bool Aof::open_and_replay(const std::string& path, storage::Database& database,
         complete_end += static_cast<off_t>(sizeof(header) + record.size());
     }
 
-    if(lseek(fd_, 0, SEEK_END) < 0){// puts the file position excatly at the end, ready for future writes 
+    const off_t end = lseek(fd_, 0, SEEK_END);// puts the file position excatly at the end, ready for future writes 
+    if(end < 0){
         error = "AOF seek failed: " + std::string(std::strerror(errno));
         return false;
     }
+    rewrite_base_size_ = static_cast<std::uint64_t>(end);
+    last_save_ = std::chrono::steady_clock::now();
+    return start_sync_thread(error);
+}
 
-    if(sync_policy_ == SyncPolicy::every_second){
-        try {
-            sync_thread_ = std::thread(&Aof::sync_loop, this);// 'this' tells run this function on this particular AOF object.
-        } 
-        catch(const std::system_error& failure) {
-            error = "AOF sync worker failed: " + std::string(failure.what());
-            return false;
-        }
+bool Aof::start_sync_thread(std::string& error) {
+    if(sync_policy_ != SyncPolicy::every_second) return true;
+    {
+        std::lock_guard<std::mutex> lock(sync_mutex_);
+        stop_sync_ = false;
+    }
+    try {
+        sync_thread_ = std::thread(&Aof::sync_loop, this);// 'this' tells run this function on this particular AOF object.
+    } 
+    catch(const std::system_error& failure) {
+        error = "AOF sync worker failed: " + std::string(failure.what());
+        return false;
     }
     return true;
 }
@@ -343,6 +369,7 @@ bool Aof::append_after_command(const std::vector<std::string>& arguments,
 
     if(!write_all(fd_, header, sizeof(header), error) ||
        !write_all(fd_, record.data(), record.size(), error)) return false;
+    changes_since_save_++;
 
     if(sync_policy_ == SyncPolicy::every_second){
         {
@@ -417,6 +444,196 @@ bool Aof::append_snapshot_checkpoint(std::string_view snapshot,
     return true;
 }
 
+void Aof::set_schedule(std::chrono::seconds save_interval, std::uint64_t rewrite_min_size) {
+    save_interval_ = save_interval;
+    rewrite_min_size_ = rewrite_min_size;
+}
+
+PersistResult Aof::save_snapshot(storage::Database& database, std::string& error) {
+    if(fd_ < 0){
+        error = "AOF is not enabled";
+        return PersistResult::failed;
+    }
+    if(!check_sync_error(error)) return PersistResult::fatal;
+
+    std::uint64_t aof_offset;
+    if(!next_snapshot_offset(aof_offset, error)) return PersistResult::fatal;
+
+    const std::string data = encode_snapshot(database, aof_offset);
+    // A failed checkpoint write may leave a partial record, so later appends
+    // would land after garbage. That is why this failure stops the server.
+    if(!append_snapshot_checkpoint(data, aof_offset, error)) return PersistResult::fatal;
+
+    // Without the snapshot file, startup replays the whole AOF, which is still correct.
+    if(!save_snapshot_file(snapshot_path(), data, error)) return PersistResult::failed;
+
+    changes_since_save_ = 0;
+    last_save_ = std::chrono::steady_clock::now();
+    return PersistResult::ok;
+}
+
+PersistResult Aof::rewrite(storage::Database& database, std::string& error) {
+
+    /*
+    Replace the AOF with the shortest log that rebuilds the current database,
+    followed by a checkpoint record, and save a matching snapshot.
+
+    The new log is complete on its own, so a missing or damaged snapshot still
+    restores everything through a full replay. Files are switched in this order
+    so a crash at any point leaves a state startup can load:
+
+      1. delete the old snapshot  -> startup fully replays the old AOF
+      2. rename the new AOF       -> startup fully replays the new AOF
+      3. rename the new snapshot  -> startup loads it and replays nothing
+    */
+    if(fd_ < 0){
+        error = "AOF is not enabled";
+        return PersistResult::failed;
+    }
+    if(!check_sync_error(error)) return PersistResult::fatal;
+
+    // Collect names first: find_live() erases an expired key, which would
+    // invalidate an iterator over database.values.
+    std::vector<std::string> keys;
+    keys.reserve(database.values.size());
+    for(const auto& item : database.values) keys.push_back(item.first);
+
+    std::string aof_temporary = path_ + ".rewrite.XXXXXX";
+    const int new_fd = mkstemp(aof_temporary.data());
+    if(new_fd < 0){
+        error = error_text("AOF rewrite file creation failed", errno);
+        return PersistResult::failed;
+    }
+    std::string snapshot_temporary;
+    auto abandon = [&]{
+        close(new_fd);
+        unlink(aof_temporary.c_str());
+        if(!snapshot_temporary.empty()) unlink(snapshot_temporary.c_str());
+    };
+
+    if(fcntl(new_fd, F_SETFD, FD_CLOEXEC) < 0){
+        error = error_text("AOF rewrite file setup failed", errno);
+        abandon();
+        return PersistResult::failed;
+    }
+
+    // One record per key keeps each record under the replay size limit.
+    std::uint64_t offset = 0;
+    std::string record;
+    for(const auto& key : keys){
+        auto found = database.find_live(key);
+        if(found == database.values.end()) continue;
+        record.clear();
+        append_entry(record, key, found->second);
+        if(record.size() > max_record_size){
+            error = "AOF rewrite record exceeds the 64 MiB limit";
+            abandon();
+            return PersistResult::failed;
+        }
+        if(!write_frame(new_fd, record, error)){
+            abandon();
+            return PersistResult::failed;
+        }
+        offset += sizeof(std::uint64_t) + record.size();
+    }
+
+    offset += checkpoint_frame_size();
+    const std::string snapshot = encode_snapshot(database, offset);
+    if(!write_frame(new_fd, checkpoint_record(std::string_view(snapshot).substr(snapshot.size() - 4)),
+                    error)){
+        abandon();
+        return PersistResult::failed;
+    }
+    if(sync_file(new_fd) < 0){
+        error = error_text("AOF rewrite sync failed", errno);
+        abandon();
+        return PersistResult::failed;
+    }
+    if(!write_temporary_file(snapshot_path(), snapshot, snapshot_temporary, error)){
+        snapshot_temporary.clear();
+        abandon();
+        return PersistResult::failed;
+    }
+
+    // Stop the sync worker so it never uses the old descriptor during the swap.
+    if(!stop_and_sync(error)){
+        abandon();
+        return PersistResult::fatal;
+    }
+
+    // Step 1: no snapshot means a full replay of whichever AOF is in place.
+    bool removed = true;
+    if(unlink(snapshot_path().c_str()) < 0 && errno != ENOENT){
+        error = error_text("Old snapshot removal failed", errno);
+        removed = false;
+    }
+    if(!removed || !sync_parent_directory(path_, error)){
+        abandon();
+        return start_sync_thread(error) ? PersistResult::failed : PersistResult::fatal;
+    }
+
+    // Step 2: the new log takes the old log's name.
+    if(rename(aof_temporary.c_str(), path_.c_str()) < 0){
+        error = error_text("AOF rewrite rename failed", errno);
+        abandon();
+        return start_sync_thread(error) ? PersistResult::failed : PersistResult::fatal;
+    }
+    close(fd_);
+    fd_ = new_fd;// it is already positioned at the end, ready for future writes
+    {
+        std::lock_guard<std::mutex> lock(sync_mutex_);
+        dirty_ = false;
+    }
+    rewrite_base_size_ = offset;
+    changes_since_save_ = 0;
+    last_save_ = std::chrono::steady_clock::now();
+
+    // If this rename may not survive a crash, later writes to the new file may
+    // vanish with it, so continuing would be unsafe.
+    if(!sync_parent_directory(path_, error)){
+        unlink(snapshot_temporary.c_str());
+        return PersistResult::fatal;
+    }
+    if(!start_sync_thread(error)){
+        unlink(snapshot_temporary.c_str());
+        return PersistResult::fatal;
+    }
+
+    // Step 3: without it, startup still fully replays the new log.
+    if(rename(snapshot_temporary.c_str(), snapshot_path().c_str()) < 0){
+        error = error_text("Snapshot rename failed", errno);
+        unlink(snapshot_temporary.c_str());
+        return PersistResult::failed;
+    }
+    if(!sync_parent_directory(path_, error)) return PersistResult::failed;
+    return PersistResult::ok;
+}
+
+PersistResult Aof::run_scheduled(storage::Database& database, std::string& error) {
+    if(fd_ < 0) return PersistResult::ok;
+    const auto now = std::chrono::steady_clock::now();
+    if(now < next_scheduled_attempt_) return PersistResult::ok;
+
+    std::uint64_t size;
+    if(!current_offset(size, error)) return PersistResult::fatal;
+
+    PersistResult result = PersistResult::ok;
+    if(rewrite_min_size_ > 0 && size >= rewrite_min_size_ &&
+       size / 2 >= rewrite_base_size_){
+        result = rewrite(database, error);
+    } 
+    else if(save_interval_.count() > 0 && changes_since_save_ > 0 &&
+              now - last_save_ >= save_interval_){
+        result = save_snapshot(database, error);
+    }
+
+    // Retry a failed attempt later instead of every loop iteration.
+    if(result == PersistResult::failed){
+        next_scheduled_attempt_ = now + std::chrono::seconds(5);
+    }
+    return result;
+}
+
 bool Aof::check_sync_error(std::string& error) {
     std::lock_guard<std::mutex> lock(sync_mutex_);
     if(!sync_error_.empty()){
@@ -443,8 +660,9 @@ void Aof::sync_loop() {
         }
 
         const std::uint64_t syncing_generation = write_generation_;
+        const int fd = fd_;// rewrite() changes fd_ only after joining this thread
         lock.unlock();
-        const int result = sync_file(fd_);
+        const int result = sync_file(fd);
         const int sync_errno = errno;
         lock.lock();
         if(result < 0){ 

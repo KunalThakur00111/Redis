@@ -6,7 +6,8 @@ strings over TCP and currently supports `PING`, `ECHO`, `SET`, `MSET`, `GET`, `D
 `TTL`, `PTTL`, `PERSIST`, `EXPIRETIME`, `PEXPIRETIME`, `GETDEL`, `INCR`, `DECR`,
 `INCRBY`, `DECRBY`, `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `LLEN`,
 `LINDEX`, `HSET`, `HGET`, `HDEL`, `HLEN`, `SADD`, `SREM`, `SISMEMBER`,
-`SCARD`, and `SMEMBERS`.
+`SCARD`, and `SMEMBERS`. With `--aof`, `SAVE` and `BGREWRITEAOF` control
+persistence.
 `SET` supports `NX`, `XX`, `EX`, `PX`, `EXAT`, and `PXAT`, including a condition
 with an expiry.
 Data is shared between clients. By default it disappears when the process exits;
@@ -69,6 +70,8 @@ cmake --build build
 ./build/redis-server --port 6380 --aof build/data.aof
 # Or sync pending log writes approximately once per second:
 ./build/redis-server --port 6380 --aof build/data.aof --aof-fsync everysec
+# Or save a snapshot every 30 seconds and rewrite the log from 16 MiB:
+./build/redis-server --aof build/data.aof --save-seconds 30 --aof-rewrite-min-size 16777216
 # Or use the single-thread comparison mode:
 ./build/redis-server --port 6380 --io-threads 1
 ```
@@ -96,14 +99,30 @@ It reduces per-write latency but can lose recent acknowledged writes after an
 operating-system crash or power failure. `--aof-fsync always` calls `fdatasync`
 before acknowledging each logged write. A background sync can still delay a
 concurrent write to the same file. The log records a whole affected key after
-a write and does not compact old records, so large values and long-running
-workloads can make writes and startup slow.
-On a clean shutdown with `--aof`, the server also writes a snapshot to
-`<aof path>.snapshot`. Startup loads a valid snapshot, verifies its checkpoint
-record in the AOF, and replays only later records. If the snapshot is missing,
-invalid, or its checkpoint record does not match, startup replays the full AOF.
-Startup fails if the AOF ends before a valid snapshot's saved checkpoint. The AOF is
-not compacted yet, and snapshots are currently written only on clean shutdown.
+a write, so large values make each write record large.
+
+A snapshot is written to `<aof path>.snapshot` on a clean shutdown, by `SAVE`,
+and every `--save-seconds` seconds (default 60) if at least one write was
+logged since the last one. Each snapshot also appends a checkpoint record to
+the AOF. Startup loads a valid snapshot, verifies its checkpoint record in the
+AOF, and replays only later records. If the snapshot is missing, invalid, or its
+checkpoint record does not match, startup replays the full AOF. Startup fails if
+the AOF ends before a valid snapshot's saved checkpoint.
+
+`BGREWRITEAOF` replaces the AOF with one record per live key plus a checkpoint,
+and saves a matching snapshot. The rewritten log is complete on its own, so
+it still restores everything if the snapshot is lost. The rewrite also runs
+automatically once the AOF is at least `--aof-rewrite-min-size` bytes (default
+64 MiB) and twice its size at startup or after the last rewrite. The files are
+switched so that a crash at any point leaves a state startup can load: the old
+snapshot is removed, then the new AOF is renamed into place, then the new snapshot.
+`--save-seconds 0` and `--aof-rewrite-min-size 0` turn either automatic step off.
+
+Unlike Redis, `SAVE` and `BGREWRITEAOF` run while holding the database lock, so
+every client waits until they finish; `BGREWRITEAOF` replies with Redis's
+"started" text only after the rewrite is done. A failed scheduled attempt is
+logged and retried after 5 seconds. A failure that may leave a partial record in
+the live AOF stops the server.
 Future mutating commands must be added to the persistence command list. The log
 has no checksum, so corruption inside an otherwise valid record may go undetected.
 
@@ -124,7 +143,7 @@ ctest --test-dir build --output-on-failure
 
 The TCP tests start their own servers on temporary ports. The test clients are
 C++ executables built by CMake; Python is not required for CTest.
-The suite also runs socket, AOF restart, SIGINT, and concurrent-client tests
+The suite also runs socket, AOF restart, AOF rewrite, SIGINT, and concurrent-client tests
 with four I/O threads. For pipelined PING, GET, SET, and INCR comparisons, run
 `./build/io-threads-bench ./build/redis-server`; it reports throughput,
 pipeline round-trip latency, and main-thread CPU use. Pass an optional value

@@ -41,6 +41,7 @@ if(BUILD_TESTING)
     add_executable(aof-sync-test
         tests/aof_sync_test.cpp
         src/persistence/aof.cpp
+        src/persistence/snapshot.cpp
         src/protocol/resp_parser.cpp
         src/protocol/resp_writer.cpp
         src/commands/command_handler.cpp
@@ -56,11 +57,16 @@ if(BUILD_TESTING)
         src/persistence/snapshot.cpp
     )
     add_executable(aof-sigint-test tests/aof_sigint_test.cpp)
+    add_executable(aof-rewrite-test
+        tests/aof_rewrite_test.cpp
+        src/persistence/snapshot.cpp
+    )
     add_executable(io-threads-test tests/io_threads_test.cpp)
     add_executable(differential-ping-test tests/differential_ping_test.cpp)
     add_executable(io-threads-bench benchmarks/io_threads.cpp)
     add_executable(command-latency-bench benchmarks/command_latency.cpp)
-    foreach(target socket-commands-test aof-restart-test aof-sigint-test io-threads-test
+    foreach(target socket-commands-test aof-restart-test aof-sigint-test aof-rewrite-test
+                   io-threads-test
                    differential-ping-test io-threads-bench command-latency-bench)
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
         target_link_libraries(${target} PRIVATE Threads::Threads)
@@ -82,6 +88,12 @@ if(BUILD_TESTING)
         COMMAND aof-restart-test $<TARGET_FILE:redis-server> --io-threads 1)
     add_test(NAME aof-sigint-single-thread
         COMMAND aof-sigint-test $<TARGET_FILE:redis-server> --io-threads 1)
+    add_test(NAME aof-rewrite
+        COMMAND aof-rewrite-test $<TARGET_FILE:redis-server>)
+    add_test(NAME aof-rewrite-single-thread
+        COMMAND aof-rewrite-test $<TARGET_FILE:redis-server> --io-threads 1)
+    add_test(NAME aof-rewrite-always
+        COMMAND aof-rewrite-test $<TARGET_FILE:redis-server> --aof-fsync always)
     add_test(NAME io-threads
         COMMAND io-threads-test $<TARGET_FILE:redis-server> --io-threads 4)
 endif()

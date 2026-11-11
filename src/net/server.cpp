@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <chrono>
 
 namespace net {
 namespace {
@@ -78,6 +79,67 @@ bool would_block() {
     return errno == EAGAIN || errno == EWOULDBLOCK;
 }
 
+std::string ascii_case(std::string text, bool upper) {
+    for(char& ch : text){
+        if(upper && ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+        if(!upper && ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    return text;
+}
+
+void log_persistence_failure(persistence::PersistResult result, const std::string& error) {
+    if(result != persistence::PersistResult::ok) std::cerr << error << '\n';
+}
+
+// Run one request and log it. SAVE and BGREWRITEAOF need the AOF, so they are
+// handled here rather than in the command handler, which only sees the database.
+// Returns false when the AOF may be damaged and the server must stop.
+bool execute_request(const std::vector<std::string>& arguments, storage::Database& database,
+                     persistence::Aof& aof, std::string& reply) {
+    const std::string name = arguments.empty() ? "" : ascii_case(arguments[0], true);
+    if(name == "SAVE" || name == "BGREWRITEAOF"){
+        if(arguments.size() != 1){
+            reply = "-ERR wrong number of arguments for '" + ascii_case(name, false) +
+                    "' command\r\n";
+            return true;
+        }
+        if(!aof.enabled()){
+            reply = "-ERR persistence is disabled; start the server with --aof\r\n";
+            return true;
+        }
+        std::string error;
+        const auto result = name == "SAVE" ? aof.save_snapshot(database, error)
+                                           : aof.rewrite(database, error);
+        log_persistence_failure(result, error);
+        if(result == persistence::PersistResult::fatal) return false;
+        if(result == persistence::PersistResult::failed){
+            reply = "-ERR " + error + "\r\n";
+        } 
+        else {
+            // BGREWRITEAOF finishes before replying here, but uses Redis's reply text.
+            reply = name == "SAVE" ? "+OK\r\n"
+                                   : "+Background append only file rewriting started\r\n";
+        }
+        return true;
+    }
+
+    reply = commands::execute_command(arguments, database);
+    std::string aof_error;
+    if(!aof.append_after_command(arguments, reply, database, aof_error)){
+        std::cerr << aof_error << '\n';
+        return false;
+    }
+    return true;
+}
+
+// Returns false when scheduled persistence failed in a way that must stop the server.
+bool run_scheduled_persistence(storage::Database& database, persistence::Aof& aof) {
+    std::string error;
+    const auto result = aof.run_scheduled(database, error);
+    log_persistence_failure(result, error);
+    return result != persistence::PersistResult::fatal;
+}
+
 // Parse every complete request currently buffered and queue its reply.
 bool process_input(Client& client, storage::Database& database,
                    persistence::Aof& aof, bool& aof_failed) {
@@ -98,10 +160,8 @@ bool process_input(Client& client, storage::Database& database,
             return true;// if we return false, then that will immideatly remove this client, that's why return true
         }
 
-        std::string reply = commands::execute_command(request.arguments, database);
-        std::string aof_error;
-        if(!aof.append_after_command(request.arguments, reply, database, aof_error)){
-            std::cerr << aof_error << '\n';
+        std::string reply;
+        if(!execute_request(request.arguments, database, aof, reply)){
             aof_failed = true;
             return false;
         }
@@ -247,19 +307,11 @@ class IoWorker {
                     return true;
                 }
 
-                std::string aof_error;
                 std::string command_reply;
                 {
                     std::lock_guard<std::mutex> lock(direct_execution_.mutex);
-                    command_reply = commands::execute_command(
-                        parsed.arguments, direct_execution_.database);
-
-                    if(!direct_execution_.aof.append_after_command(
-                            parsed.arguments, command_reply,
-                            direct_execution_.database, aof_error)){
-
-                        std::cerr << aof_error << '\n';
-                        
+                    if(!execute_request(parsed.arguments, direct_execution_.database,
+                                        direct_execution_.aof, command_reply)){
                         direct_execution_.failed.store(true, std::memory_order_relaxed);
                         stop_requested.store(true, std::memory_order_relaxed);
                         return false;
@@ -552,6 +604,10 @@ int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
 
         std::lock_guard<std::mutex> lock(direct_execution.mutex);
         database.expire_some(16);
+        if(!run_scheduled_persistence(database, aof)){
+            exit_status = 1;
+            break;
+        }
     }
 
     stop_requested.store(true, std::memory_order_relaxed);
@@ -562,29 +618,23 @@ int run_threaded_loop(int listener, int epoll_fd, storage::Database& database,
     return exit_status;
 }
 
-bool save_shutdown_snapshot(const std::string& aof_path, storage::Database& database,
-                            persistence::Aof& aof, std::string& error) {
-
-    // aof_path: the user’s AOF filename, such as build/data.aof.                            
-    if(aof_path.empty()) return true;// if the server started without --aof, this steps does nothing. it return success becuase there
-    //                                  is no AOF and this optional snapshot operation is not enabled.
-
-    std::uint64_t aof_offset;
-    if(!aof.next_snapshot_offset(aof_offset, error)) return false;
-    
-    const std::string data = persistence::encode_snapshot(database, aof_offset);
-    if(!aof.append_snapshot_checkpoint(data, aof_offset, error)) return false;
-    return persistence::save_snapshot_file(aof_path + ".snapshot", data, error);
+bool save_shutdown_snapshot(storage::Database& database, persistence::Aof& aof,
+                            std::string& error) {
+    // Without --aof there is no log, so this optional step does nothing.
+    if(!aof.enabled()) return true;
+    return aof.save_snapshot(database, error) == persistence::PersistResult::ok;
 }
 
 }  // namespace
 
 int run_server(std::uint16_t port, const std::string& aof_path,
-               bool sync_every_second, int io_threads) {
+               bool sync_every_second, int io_threads,
+               std::uint32_t save_seconds, std::uint64_t rewrite_min_size) {
 
     storage::Database database;
     persistence::Aof aof(sync_every_second ? persistence::SyncPolicy::every_second
                                             : persistence::SyncPolicy::always);
+    aof.set_schedule(std::chrono::seconds(save_seconds), rewrite_min_size);
 
 
     stop_requested.store(false, std::memory_order_relaxed);
@@ -688,7 +738,7 @@ int run_server(std::uint16_t port, const std::string& aof_path,
             std::cerr << aof_error << '\n';
             exit_status = 1;
         }
-        if(exit_status == 0 && !save_shutdown_snapshot(aof_path, database, aof, aof_error)){
+        if(exit_status == 0 && !save_shutdown_snapshot(database, aof, aof_error)){
             std::cerr << aof_error << '\n';
             exit_status = 1;
         }
@@ -830,6 +880,10 @@ int run_server(std::uint16_t port, const std::string& aof_path,
             break;
         }
         database.expire_some(16);
+        if(!run_scheduled_persistence(database, aof)){
+            exit_status = 1;
+            break;
+        }
     }
     
     close_clients(clients);
@@ -839,7 +893,7 @@ int run_server(std::uint16_t port, const std::string& aof_path,
         std::cerr << aof_error << '\n';
         exit_status = 1;
     }
-    if(exit_status == 0 && !save_shutdown_snapshot(aof_path, database, aof, aof_error)){
+    if(exit_status == 0 && !save_shutdown_snapshot(database, aof, aof_error)){
         std::cerr << aof_error << '\n';
         exit_status = 1;
     }

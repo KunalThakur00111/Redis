@@ -14,8 +14,18 @@ int main(int argc, char* argv[]) {
     bool aof_seen = false;
     bool fsync_seen = false;
     bool io_threads_seen = false;
+    bool save_seen = false;
+    bool rewrite_size_seen = false;
     bool sync_every_second = true;
     int io_threads = 4;
+    std::uint32_t save_seconds = net::default_save_seconds;
+    std::uint64_t rewrite_min_size = net::default_rewrite_min_size;
+
+    // Parse a whole decimal number; partial text such as "10s" is rejected.
+    auto parse_number = [](std::string_view text, auto& value){
+        const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+        return result.ec == std::errc{} && result.ptr == text.data() + text.size();
+    };
 
     // Accept --port and --aof in either order, once each.
     for(int i = 1; i < argc; i += 2){
@@ -50,20 +60,28 @@ int main(int argc, char* argv[]) {
                requested_threads < 1 || requested_threads > 16) break;
             io_threads = requested_threads;
             io_threads_seen = true;
+        } else if(option == "--save-seconds" && !save_seen){
+            if(!parse_number(argv[i + 1], save_seconds)) break;
+            save_seen = true;
+        } else if(option == "--aof-rewrite-min-size" && !rewrite_size_seen){
+            if(!parse_number(argv[i + 1], rewrite_min_size)) break;
+            rewrite_size_seen = true;
         } else {
             break;
         }
 
         if(i + 2 == argc){
-            if(fsync_seen && !aof_seen) break;
+            // These options only affect the AOF, so they need --aof.
+            if((fsync_seen || save_seen || rewrite_size_seen) && !aof_seen) break;
             return net::run_server(port, aof_path, sync_every_second,
-                                   io_threads);
+                                   io_threads, save_seconds, rewrite_min_size);
         }
     }
 
     if(argc == 1) return net::run_server(port, aof_path);
     std::cerr << "Usage: " << argv[0]
               << " [--port 1-65535] [--aof path] [--aof-fsync always|everysec]"
-              << " [--io-threads 1-16]\n";
+              << " [--io-threads 1-16]\n"
+              << "       [--save-seconds N (0 = off)] [--aof-rewrite-min-size BYTES (0 = off)]\n";
     return 1;
 }

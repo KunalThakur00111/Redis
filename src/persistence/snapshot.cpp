@@ -302,31 +302,19 @@ bool decode_snapshot(std::string_view data, storage::Database& database,
     return true;
 }
 
-bool save_snapshot_file(const std::string& path, std::string_view data,
-                        std::string& error) {
+bool write_temporary_file(const std::string& path, std::string_view data,
+                          std::string& temporary_path, std::string& error) {
 
     /*
-    Save the new snapshot without overwriting the old one while writing.
-
-    First, create a temporary file in the same directory as the final snapshot
-    and write and sync all its bytes. Until then, the old snapshot remains intact.
-
-    rename(temporary, path) atomically changes the final filename to refer to the
-    complete new file. The temporary filename disappears. The old file loses its
-    name and is reclaimed once nothing else has it open.
-
-    The paths passed to rename() already identify the parent directory. We open
-    that directory separately only so fsync(directory_fd) can persist the filename
-    change. fdatasync(fd) persists the new file's contents; fsync(directory_fd)
-    persists the directory entry that names it.
-    */                        
-    std::string temporary = path + ".tmp.XXXXXX";
-
-    int fd = mkstemp(temporary.data());// mkstemp replaces the six X characters with a unique suffix, creates that file, and opens it.
-    //                                    it returns a file descriptor on success, or -1 on failure
+    Write the bytes into a brand-new file beside path and sync them. The caller
+    later renames it over path, so readers never see a half-written file.
+    mkstemp replaces the six X characters with a unique suffix, creates that file,
+    and opens it. It returns a file descriptor on success, or -1 on failure.
+    */
+    temporary_path = path + ".tmp.XXXXXX";
+    int fd = mkstemp(temporary_path.data());
     if(fd < 0){
-        error = "Snapshot temporary file creation failed: " +
-                std::string(std::strerror(errno));
+        error = "Temporary file creation failed: " + std::string(std::strerror(errno));
         return false;
     }
 
@@ -340,8 +328,8 @@ bool save_snapshot_file(const std::string& path, std::string_view data,
         } else {
             const int saved_errno = result == 0 ? EIO : errno;
             close(fd);
-            unlink(temporary.c_str());
-            error = "Snapshot write failed: " + std::string(std::strerror(saved_errno));
+            unlink(temporary_path.c_str());
+            error = "Temporary file write failed: " + std::string(std::strerror(saved_errno));
             return false;
         }
     }
@@ -354,59 +342,74 @@ bool save_snapshot_file(const std::string& path, std::string_view data,
     if(sync_result < 0){
         const int saved_errno = errno;
         close(fd);
-        unlink(temporary.c_str());
-        error = "Snapshot sync failed: " + std::string(std::strerror(saved_errno));
+        unlink(temporary_path.c_str());
+        error = "Temporary file sync failed: " + std::string(std::strerror(saved_errno));
         return false;
     }
 
     if(close(fd) < 0){
         const int saved_errno = errno;
-        unlink(temporary.c_str());
-        error = "Snapshot close failed: " + std::string(std::strerror(saved_errno));
+        unlink(temporary_path.c_str());
+        error = "Temporary file close failed: " + std::string(std::strerror(saved_errno));
         return false;
     }
+    return true;
+}
 
-    // find the parent directory
-    const std::size_t slash = path.find_last_of('/');// find the last slash in the final filename.
+bool sync_parent_directory(const std::string& path, std::string& error) {
+
+    /*
+    rename() and unlink() change a directory entry, not the file's bytes.
+    fsync(directory_fd) makes that name change survive a power failure.
+    */
+    const std::size_t slash = path.find_last_of('/');// find the last slash in the filename.
     const std::string directory = slash == std::string::npos ? "." :
                                   slash == 0 ? "/" : path.substr(0, slash);
 
-                            
-    // first argument: directory path as a c string
-    // O_RDONLY: open for reading, O_DIRECTORY: require this path to be a directory, O_CLOSEXEC: close if run different program
+    // O_RDONLY: open for reading, O_DIRECTORY: require this path to be a directory, O_CLOEXEC: close if run different program
     int directory_fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if(directory_fd < 0){
-        const int saved_errno = errno;
-        unlink(temporary.c_str());
-        error = "Snapshot directory open failed: " +
-                std::string(std::strerror(saved_errno));
+        error = "Directory open failed: " + std::string(std::strerror(errno));
         return false;
     }
+    if(fsync(directory_fd) < 0){
+        const int saved_errno = errno;
+        close(directory_fd);
+        error = "Directory sync failed: " + std::string(std::strerror(saved_errno));
+        return false;
+    }
+    if(close(directory_fd) < 0){
+        error = "Directory close failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+bool save_snapshot_file(const std::string& path, std::string_view data,
+                        std::string& error) {
+
+    /*
+    Save the new snapshot without overwriting the old one while writing.
+
+    First, write and sync all bytes into a temporary file in the same directory.
+    Until then, the old snapshot remains intact.
+
+    rename(temporary, path) atomically changes the final filename to refer to the
+    complete new file. The old file loses its name and is reclaimed once nothing
+    else has it open. Syncing the directory persists that filename change.
+    */
+    std::string temporary;
+    if(!write_temporary_file(path, data, temporary, error)) return false;
 
     // rename(old_path, new_path)
     if(rename(temporary.c_str(), path.c_str()) < 0){
         const int saved_errno = errno;
-        close(directory_fd);
         unlink(temporary.c_str());
         error = "Snapshot rename failed: " + std::string(std::strerror(saved_errno));
         return false;
     }
-    // after a successful rename , the temperory file name is gone; it's context are now reachable at path.
-
-    if(fsync(directory_fd) < 0){
-        const int saved_errno = errno;
-        close(directory_fd);
-        error = "Snapshot directory sync failed: " +
-                std::string(std::strerror(saved_errno));
-        return false;
-    }
-
-    if(close(directory_fd) < 0){
-        error = "Snapshot directory close failed: " +
-                std::string(std::strerror(errno));
-        return false;
-    }
-    return true;
+    // after a successful rename, the temporary file name is gone; its contents are now reachable at path.
+    return sync_parent_directory(path, error);
 }
 
 bool load_snapshot_file(const std::string& path, std::string& data,
