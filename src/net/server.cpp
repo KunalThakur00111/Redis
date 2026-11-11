@@ -136,7 +136,9 @@ std::string info_reply(const std::vector<std::string>& arguments, storage::Datab
             "tcp_port:" + std::to_string(settings.port) + "\r\n"
             "uptime_in_seconds:" + std::to_string(uptime) + "\r\n"
             "uptime_in_days:" + std::to_string(uptime / 86400) + "\r\n"
-            "io_threads_active:" + std::to_string(settings.io_threads) + "\r\n");
+            // Redis's io_threads_active is a 0/1 flag, so the count gets its own field.
+            "io_threads_active:" + std::string(settings.io_threads > 1 ? "1" : "0") + "\r\n"
+            "io_threads:" + std::to_string(settings.io_threads) + "\r\n");
     }
     if(persistence_section){
         std::string text =

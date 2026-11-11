@@ -196,6 +196,13 @@ int main(int argc, char* argv[]) {
             TEST_CHECK(all.find("tcp_port:" + std::to_string(server.port()) + "\r\n") !=
                        std::string::npos);
             TEST_CHECK(all.find("aof_enabled:0\r\n") != std::string::npos);
+            // io_threads_active is a flag, as in Redis; the count is separate.
+            const bool threaded = !(extra.size() >= 2 && extra[0] == "--io-threads" &&
+                                    extra[1] == "1");
+            TEST_CHECK(all.find(std::string("io_threads_active:") + (threaded ? "1" : "0") +
+                                "\r\n") != std::string::npos);
+            TEST_CHECK(all.find(std::string("io_threads:") + (threaded ? "4" : "1") + "\r\n") !=
+                       std::string::npos);
             TEST_CHECK(exchange({"INFO", "nosuchsection"}) == "$0\r\n\r\n");
         }
 
