@@ -122,14 +122,19 @@ void remove_stale_temporaries(const std::string& aof_path) {
     const std::string prefixes[] = {name + ".rewrite.", name + ".snapshot.tmp."};
     const fs::path directory = path.has_parent_path() ? path.parent_path() : fs::path(".");
 
-    std::error_code ignored;
-    for(const auto& item : fs::directory_iterator(directory, ignored)){
-        const std::string candidate = item.path().filename().string();
+    // This is best effort, so every call uses an error_code and never throws.
+    // A range-for would use the throwing operator++, so increment(error) is
+    // called instead, and the loop stops at the first read error.
+    std::error_code error;
+    fs::directory_iterator item(directory, error);
+    for(; !error && item != fs::directory_iterator(); item.increment(error)){
+        const std::string candidate = item->path().filename().string();
         for(const auto& prefix : prefixes){
+            std::error_code ignored;
             if(candidate.size() == prefix.size() + 6 &&
                candidate.compare(0, prefix.size(), prefix) == 0 &&
-               item.is_regular_file(ignored)){
-                fs::remove(item.path(), ignored);
+               item->is_regular_file(ignored)){
+                fs::remove(item->path(), ignored);
             }
         }
     }
