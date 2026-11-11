@@ -77,6 +77,8 @@ class Aof {
                                         std::uint64_t expected_offset, std::string& error);
 
         bool enabled() const { return fd_ >= 0; }
+        // Logged writes since the last snapshot; read under the database lock.
+        std::uint64_t changes_since_save() const { return changes_since_save_; }
 
         // Configure periodic work done by run_scheduled(). A snapshot is saved
         // every save_interval when at least one write was logged. The AOF is

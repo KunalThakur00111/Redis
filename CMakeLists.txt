@@ -17,6 +17,7 @@ add_executable(redis-server
     src/protocol/resp_parser.cpp
     src/protocol/resp_writer.cpp
     src/commands/command_handler.cpp
+    src/commands/glob.cpp
 )
 target_compile_options(redis-server PRIVATE -Wall -Wextra -Wpedantic)
 find_package(Threads REQUIRED)
@@ -30,6 +31,13 @@ if(BUILD_TESTING)
     )
     target_compile_options(resp-parser-test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME resp-parser COMMAND resp-parser-test)
+
+    add_executable(glob-test
+        tests/glob_test.cpp
+        src/commands/glob.cpp
+    )
+    target_compile_options(glob-test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME glob COMMAND glob-test)
 
     add_executable(snapshot-test
         tests/snapshot_test.cpp
@@ -45,6 +53,7 @@ if(BUILD_TESTING)
         src/protocol/resp_parser.cpp
         src/protocol/resp_writer.cpp
         src/commands/command_handler.cpp
+        src/commands/glob.cpp
     )
     target_compile_options(aof-sync-test PRIVATE -Wall -Wextra -Wpedantic)
     target_link_libraries(aof-sync-test PRIVATE Threads::Threads)
@@ -52,6 +61,7 @@ if(BUILD_TESTING)
     add_test(NAME aof-sync COMMAND aof-sync-test)
 
     add_executable(socket-commands-test tests/socket_commands_test.cpp)
+    add_executable(admin-commands-test tests/admin_commands_test.cpp)
     add_executable(aof-restart-test
         tests/aof_restart_test.cpp
         src/persistence/snapshot.cpp
@@ -65,7 +75,7 @@ if(BUILD_TESTING)
     add_executable(differential-ping-test tests/differential_ping_test.cpp)
     add_executable(io-threads-bench benchmarks/io_threads.cpp)
     add_executable(command-latency-bench benchmarks/command_latency.cpp)
-    foreach(target socket-commands-test aof-restart-test aof-sigint-test aof-rewrite-test
+    foreach(target socket-commands-test admin-commands-test aof-restart-test aof-sigint-test aof-rewrite-test
                    io-threads-test
                    differential-ping-test io-threads-bench command-latency-bench)
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
@@ -76,6 +86,10 @@ if(BUILD_TESTING)
         COMMAND socket-commands-test $<TARGET_FILE:redis-server>)
     add_test(NAME socket-commands-single-thread
         COMMAND socket-commands-test $<TARGET_FILE:redis-server> --io-threads 1)
+    add_test(NAME admin-commands
+        COMMAND admin-commands-test $<TARGET_FILE:redis-server>)
+    add_test(NAME admin-commands-single-thread
+        COMMAND admin-commands-test $<TARGET_FILE:redis-server> --io-threads 1)
     add_test(NAME aof-restart
         COMMAND aof-restart-test $<TARGET_FILE:redis-server>)
     add_test(NAME aof-restart-everysec

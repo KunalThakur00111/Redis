@@ -1,6 +1,7 @@
 #include "command_handler.h"
 
 #include "../protocol/resp_writer.h"
+#include "glob.h"
 
 #include <cstdint>
 #include <string>
@@ -11,6 +12,9 @@
 #include <limits>
 #include <system_error>
 #include <variant>
+#include <algorithm>
+#include <functional>
+#include <utility>
 
 namespace commands {
 namespace {
@@ -63,6 +67,115 @@ bool parse_int64(const std::string& text, std::int64_t& value) {
 
     return result.ec == std::errc{} /*an error code; a default value (std::errc{}) means no conversion error.*/
                         && result.ptr == last; // where parsing stops;
+}
+
+constexpr const char* syntax_error = "-ERR syntax error\r\n";
+constexpr const char* not_integer_error = "-ERR value is not an integer or out of range\r\n";
+
+// Every command name this server accepts, for COMMAND COUNT and COMMAND LIST.
+// SAVE, BGREWRITEAOF, INFO and CONFIG are run by the server, not this file.
+constexpr const char* supported_commands[] = {
+    "PING", "ECHO", "SET", "MSET", "GET", "DEL", "EXISTS", "DBSIZE", "MGET",
+    "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "TTL", "PTTL", "PERSIST",
+    "EXPIRETIME", "PEXPIRETIME", "GETDEL", "INCR", "DECR", "INCRBY", "DECRBY",
+    "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX",
+    "HSET", "HGET", "HDEL", "HLEN", "SADD", "SREM", "SISMEMBER", "SCARD", "SMEMBERS",
+    "TYPE", "KEYS", "SCAN", "RENAME", "RENAMENX", "FLUSHDB", "FLUSHALL", "SELECT",
+    "COMMAND", "INFO", "CONFIG", "SAVE", "BGREWRITEAOF",
+};
+
+// Text quoted inside an error reply must not end the line early.
+std::string one_line(std::string text) {
+    for(char& ch : text){
+        if(ch == '\r' || ch == '\n') ch = ' ';
+    }
+    return text;
+}
+
+std::string encode_bulk_strings(const std::vector<std::string>& values) {
+    std::vector<std::string> encoded;
+    encoded.reserve(values.size());
+    for(const auto& value : values) encoded.push_back(protocol::encode_bulk_string(value));
+    return protocol::encode_array(encoded);
+}
+
+/*
+SCAN cursor design. Redis walks its hash table's buckets, which works because it
+controls how the table grows. std::unordered_map can rehash into a different
+bucket order at any insert, so a bucket index would skip keys after a rehash.
+
+Instead, the cursor is a position in the order of each key's 64-bit hash, which
+never changes while the process runs. Each call returns the keys with the
+smallest hashes at or above the cursor, and the next cursor is one past the
+largest hash returned. So every key present for the whole scan is returned,
+however the map grows or shrinks. The cost: each call reads every key, so a
+full scan costs O(N * N / COUNT) rather than O(N).
+*/
+std::string scan_keys(const std::vector<std::string>& arguments, storage::Database& database) {
+    const std::string& cursor_text = arguments[1];
+    std::uint64_t cursor = 0;
+    const auto parsed = std::from_chars(cursor_text.data(),
+                                        cursor_text.data() + cursor_text.size(), cursor);
+    if(cursor_text.empty() || parsed.ec != std::errc{} ||
+       parsed.ptr != cursor_text.data() + cursor_text.size()){
+        return "-ERR invalid cursor\r\n";
+    }
+
+    std::int64_t batch = 10;
+    std::optional<std::string> pattern;
+    std::optional<std::string> type;
+    for(std::size_t i = 2; i < arguments.size(); i += 2){
+        const std::string option = uppercase_ascii(arguments[i]);
+        if(i + 1 >= arguments.size()) return syntax_error;
+        if(option == "COUNT"){
+            if(!parse_int64(arguments[i + 1], batch)) return not_integer_error;
+            if(batch < 1) return syntax_error;
+        } 
+        else if(option == "MATCH"){
+            pattern = arguments[i + 1];
+        } 
+        else if(option == "TYPE"){
+            type = lower_ascii(arguments[i + 1]);
+        } 
+        else {
+            return syntax_error;
+        }
+    }
+
+    const std::hash<std::string> hasher;
+    std::vector<std::pair<std::uint64_t, std::string>> candidates;
+    for(auto& key : database.live_keys()){
+        const std::uint64_t hash = hasher(key);
+        if(hash >= cursor) candidates.emplace_back(hash, std::move(key));
+    }
+
+    std::size_t take = candidates.size();
+    std::uint64_t next_cursor = 0;
+    if(static_cast<std::uint64_t>(batch) < candidates.size()){
+        // Put the batch smallest hashes first, then also take every key that
+        // shares the last hash so no key is split across two calls.
+        auto by_hash = [](const auto& a, const auto& b){ return a.first < b.first; };
+        auto boundary = candidates.begin() + static_cast<std::ptrdiff_t>(batch - 1);
+        std::nth_element(candidates.begin(), boundary, candidates.end(), by_hash);
+        const std::uint64_t last_hash = boundary->first;
+        auto rest = std::partition(candidates.begin(), candidates.end(),
+                                   [&](const auto& item){ return item.first <= last_hash; });
+        take = static_cast<std::size_t>(rest - candidates.begin());
+        if(take < candidates.size()) next_cursor = last_hash + 1;// last_hash < every remaining hash
+    }
+
+    // Like Redis, MATCH and TYPE filter a batch after it is chosen, so a call can
+    // return fewer keys than COUNT, or none, before the scan is finished.
+    std::vector<std::string> keys;
+    for(std::size_t i = 0; i < take; i++){
+        const std::string& key = candidates[i].second;
+        if(pattern && !glob_match(*pattern, key)) continue;
+        if(type && database.type_name(key) != *type) continue;
+        keys.push_back(key);
+    }
+
+    return "*2\r\n" + protocol::encode_bulk_string(std::to_string(next_cursor)) +
+           encode_bulk_strings(keys);
 }
 
 }  // namespace
@@ -709,6 +822,78 @@ std::string execute_command(const std::vector<std::string>& arguments,
         }
 
         return protocol::encode_array(encoded_members);
+    }
+
+    if(name == "TYPE"){
+        if(count != 2) return wrong_argument_count(name);
+        return "+" + database.type_name(arguments[1]) + "\r\n";
+    }
+
+    if(name == "KEYS"){
+        if(count != 2) return wrong_argument_count(name);
+        std::vector<std::string> keys;
+        for(auto& key : database.live_keys()){
+            if(glob_match(arguments[1], key)) keys.push_back(std::move(key));
+        }
+        return encode_bulk_strings(keys);
+    }
+
+    if(name == "SCAN"){
+        if(count < 2) return wrong_argument_count(name);
+        return scan_keys(arguments, database);
+    }
+
+    if(name == "RENAME" || name == "RENAMENX"){
+        if(count != 3) return wrong_argument_count(name);
+        const bool only_if_absent = name == "RENAMENX";
+        const auto renamed = database.rename(arguments[1], arguments[2], only_if_absent);
+        if(!renamed) return "-ERR no such key\r\n";
+        if(!only_if_absent) return "+OK\r\n";
+        return protocol::encode_integer(*renamed ? 1 : 0);
+    }
+
+    if(name == "FLUSHDB" || name == "FLUSHALL"){
+        if(count > 2) return syntax_error;
+        if(count == 2){
+            const std::string mode = uppercase_ascii(arguments[1]);
+            if(mode != "ASYNC" && mode != "SYNC") return syntax_error;
+        }
+        database.clear();
+        return "+OK\r\n";
+    }
+
+    if(name == "SELECT"){
+        if(count != 2) return wrong_argument_count(name);
+        std::int64_t index = 0;
+        if(!parse_int64(arguments[1], index)) return not_integer_error;
+        // Only database 0 exists.
+        if(index != 0) return "-ERR DB index is out of range\r\n";
+        return "+OK\r\n";
+    }
+
+    if(name == "COMMAND"){
+        if(count == 1){
+            return "-ERR COMMAND without a subcommand is not supported; "
+                   "use COMMAND COUNT, COMMAND LIST or COMMAND DOCS\r\n";
+        }
+        const std::string subcommand = uppercase_ascii(arguments[1]);
+        if(subcommand == "COUNT" && count == 2){
+            return protocol::encode_integer(static_cast<std::int64_t>(
+                sizeof(supported_commands) / sizeof(supported_commands[0])));
+        }
+        if(subcommand == "LIST" && count == 2){
+            std::vector<std::string> names;
+            for(const char* command : supported_commands) names.push_back(lower_ascii(command));
+            return encode_bulk_strings(names);
+        }
+        // redis-cli asks for COMMAND DOCS when it connects. No documentation is
+        // kept here, and an empty reply tells it to go without hints.
+        if(subcommand == "DOCS") return "*0\r\n";
+        if(subcommand == "COUNT" || subcommand == "LIST"){
+            return "-ERR wrong number of arguments for 'command|" + lower_ascii(subcommand) +
+                   "' command\r\n";
+        }
+        return "-ERR unknown subcommand '" + one_line(arguments[1]) + "'. Try COMMAND HELP.\r\n";
     }
 
     return "-ERR unknown command\r\n";

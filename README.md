@@ -8,8 +8,21 @@ strings over TCP and currently supports `PING`, `ECHO`, `SET`, `MSET`, `GET`, `D
 `LINDEX`, `HSET`, `HGET`, `HDEL`, `HLEN`, `SADD`, `SREM`, `SISMEMBER`,
 `SCARD`, and `SMEMBERS`. With `--aof`, `SAVE` and `BGREWRITEAOF` control
 persistence.
+Admin commands: `TYPE`, `KEYS`, `SCAN` (with `MATCH`, `COUNT` and `TYPE`),
+`RENAME`, `RENAMENX`, `FLUSHDB`, `FLUSHALL`, `SELECT` (database 0 only), `INFO`
+(server, persistence and keyspace sections), `CONFIG GET`, and `COMMAND COUNT`,
+`COMMAND LIST` and `COMMAND DOCS` (which returns no documentation, so
+`redis-cli` works without command hints).
 `SET` supports `NX`, `XX`, `EX`, `PX`, `EXAT`, and `PXAT`, including a condition
 with an expiry.
+
+`KEYS`, `SCAN MATCH` and `CONFIG GET` use Redis glob patterns (`*`, `?`, `[abc]`,
+`[^a]`, `[a-z]`, `\x`). A `SCAN` cursor is a position in the order of each key's
+64-bit hash rather than a hash-table bucket, because `std::unordered_map` can
+reorder its buckets at any insert. So, as in Redis, every key present for a whole
+scan is returned at least once. Unlike Redis, each `SCAN` call reads every key,
+so a full scan of N keys costs about N × N / COUNT. `INFO` reports
+`redis_version:8.2.9` because that is the compatibility target.
 Data is shared between clients. By default it disappears when the process exits;
 the optional append-only log described below restores it on restart.
 

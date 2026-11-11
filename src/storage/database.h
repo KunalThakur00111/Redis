@@ -402,6 +402,61 @@ struct Database {
         return set->size();
     }
 
+    // TYPE's reply word for a key: "none" when it is missing or expired.
+    std::string type_name(const std::string& key){
+        auto found = find_live(key);
+        if(found == values.end()) return "none";
+        const auto& value = found->second.value;
+        if(std::holds_alternative<std::string>(value)) return "string";
+        if(std::holds_alternative<std::deque<std::string>>(value)) return "list";
+        if(std::holds_alternative<Hash>(value)) return "hash";
+        return "set";
+    }
+
+    // Names of every key that has not expired. Expired keys are left for
+    // find_live() or active expiry to remove, so this never changes the map.
+    std::vector<std::string> live_keys() const {
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        std::vector<std::string> keys;
+        keys.reserve(values.size());
+        for(const auto& item : values){
+            if(item.second.expires_at_ms && *item.second.expires_at_ms <= now_ms) continue;
+            keys.push_back(item.first);
+        }
+        return keys;
+    }
+
+    // RENAME moves the value and its expiry. Returns nullopt when the source is
+    // missing, false when only_if_absent is set and the destination exists.
+    std::optional<bool> rename(const std::string& source, const std::string& destination,
+                               bool only_if_absent){
+        auto found = find_live(source);
+        if(found == values.end()) return std::nullopt;
+        if(source == destination) return !only_if_absent;
+
+        if(find_live(destination) != values.end()){
+            if(only_if_absent) return false;
+            // Erasing one unordered_map element leaves iterators to the others valid.
+            erase_live(destination);
+        }
+
+        Entry moved = std::move(found->second);
+        erase_entry(found);
+        const bool expires = moved.expires_at_ms.has_value();
+        values.emplace(destination, std::move(moved));
+        if(expires) track_expiry(destination);
+        return true;
+    }
+
+    // FLUSHDB and FLUSHALL: one database exists, so both remove everything.
+    void clear(){
+        values.clear();
+        expiring_keys.clear();
+        expiry_positions.clear();
+        expiry_cursor = 0;
+    }
+
     std::optional<std::vector<std::string>> smembers(const std::string& key){
         auto found = find_live(key);
         if(found == values.end()) return std::vector<std::string>{};

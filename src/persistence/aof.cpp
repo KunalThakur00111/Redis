@@ -64,6 +64,11 @@ std::vector<std::string> affected_keys(const std::vector<std::string>& arguments
     else if(name == "DEL"){
         for(std::size_t i = 1; i < arguments.size(); i++) keys.push_back(arguments[i]);
     } 
+    else if(arguments.size() >= 3 && (name == "RENAME" || name == "RENAMENX")){
+        // Both keys change: the source is removed and the destination replaced.
+        keys.push_back(arguments[1]);
+        keys.push_back(arguments[2]);
+    } 
     else if(arguments.size() >= 2 &&
               (name == "SET" || name == "GETDEL" || name == "INCR" ||
                name == "DECR" || name == "INCRBY" || name == "DECRBY" ||
@@ -385,10 +390,19 @@ bool Aof::append_after_command(const std::vector<std::string>& arguments,
 
     if(!check_sync_error(error)) return false;
     if(fd_ < 0 || reply.empty() || reply[0] == '-') return true;
-    const auto keys = affected_keys(arguments);
-    if(keys.empty()) return true;
 
-    const std::string record = snapshot_keys(keys, database);
+    std::string record;
+    const std::string name = arguments.empty() ? "" : uppercase_ascii(arguments[0]);
+    if(name == "FLUSHDB" || name == "FLUSHALL"){
+        // The keys are already gone, so log the command itself; replaying it
+        // empties the database at the same point in the log.
+        append_command(record, {"FLUSHALL"});
+    } 
+    else {
+        const auto keys = affected_keys(arguments);
+        if(keys.empty()) return true;
+        record = snapshot_keys(keys, database);
+    }
     if(record.empty() || record.size() > max_record_size){
         error = "AOF record exceeds the 64 MiB limit";
         return false;

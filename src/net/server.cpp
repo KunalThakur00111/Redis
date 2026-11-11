@@ -1,9 +1,11 @@
 #include "server.h"
 
 #include "../commands/command_handler.h"
+#include "../commands/glob.h"
 #include "../persistence/aof.h"
 #include "../persistence/snapshot.h"
 #include "../protocol/resp_parser.h"
+#include "../protocol/resp_writer.h"
 #include "../storage/database.h"
 
 #include <array>
@@ -87,16 +89,147 @@ std::string ascii_case(std::string text, bool upper) {
     return text;
 }
 
+// Settings INFO and CONFIG GET report. run_server() fills this in before any
+// client thread starts, and nothing changes it afterwards, so reads need no lock.
+struct ServerSettings {
+    std::uint16_t port = 0;
+    int io_threads = 0;
+    bool sync_every_second = true;
+    std::uint32_t save_seconds = 0;
+    std::uint64_t rewrite_min_size = 0;
+    std::chrono::steady_clock::time_point started;
+};
+ServerSettings settings;
+
+std::string one_line(std::string text) {
+    for(char& ch : text){
+        if(ch == '\r' || ch == '\n') ch = ' ';
+    }
+    return text;
+}
+
+// INFO [section ...]: the server, persistence and keyspace sections, in that
+// order whatever order they were asked for. Unknown names add nothing.
+std::string info_reply(const std::vector<std::string>& arguments, storage::Database& database,
+                       persistence::Aof& aof) {
+    bool server = arguments.size() == 1;
+    bool persistence_section = server;
+    bool keyspace = server;
+    for(std::size_t i = 1; i < arguments.size(); i++){
+        const std::string section = ascii_case(arguments[i], false);
+        const bool all = section == "all" || section == "default" || section == "everything";
+        server = server || all || section == "server";
+        persistence_section = persistence_section || all || section == "persistence";
+        keyspace = keyspace || all || section == "keyspace";
+    }
+
+    std::vector<std::string> sections;
+    if(server){
+        const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - settings.started).count();
+        sections.push_back(
+            "# Server\r\n"
+            "redis_version:8.2.9\r\n"// the compatibility target, not a claim to be Redis
+            "redis_mode:standalone\r\n"
+            "arch_bits:" + std::to_string(sizeof(void*) * 8) + "\r\n"
+            "process_id:" + std::to_string(getpid()) + "\r\n"
+            "tcp_port:" + std::to_string(settings.port) + "\r\n"
+            "uptime_in_seconds:" + std::to_string(uptime) + "\r\n"
+            "uptime_in_days:" + std::to_string(uptime / 86400) + "\r\n"
+            "io_threads_active:" + std::to_string(settings.io_threads) + "\r\n");
+    }
+    if(persistence_section){
+        std::string text =
+            "# Persistence\r\n"
+            "loading:0\r\n"
+            "rdb_changes_since_last_save:" + std::to_string(aof.changes_since_save()) + "\r\n"
+            "aof_enabled:" + std::string(aof.enabled() ? "1" : "0") + "\r\n"
+            "aof_rewrite_in_progress:0\r\n";
+        std::uint64_t size = 0;
+        std::string ignored;
+        if(aof.enabled() && aof.current_offset(size, ignored)){
+            text += "aof_current_size:" + std::to_string(size) + "\r\n";
+        }
+        sections.push_back(text);
+    }
+    if(keyspace){
+        std::string text = "# Keyspace\r\n";
+        // Like Redis, an empty database has no db0 line.
+        if(!database.values.empty()){
+            text += "db0:keys=" + std::to_string(database.values.size()) +
+                    ",expires=" + std::to_string(database.expiring_keys.size()) +
+                    ",avg_ttl=0\r\n";
+        }
+        sections.push_back(text);
+    }
+
+    std::string body;
+    for(std::size_t i = 0; i < sections.size(); i++){
+        if(i > 0) body += "\r\n";
+        body += sections[i];
+    }
+    return protocol::encode_bulk_string(body);
+}
+
+// CONFIG GET parameter [parameter ...]: each argument is a glob over the
+// parameter names below. The reply is a flat name, value, name, value array.
+std::string config_reply(const std::vector<std::string>& arguments, persistence::Aof& aof) {
+    if(arguments.size() < 2) return "-ERR wrong number of arguments for 'config' command\r\n";
+    const std::string subcommand = ascii_case(arguments[1], true);
+    if(subcommand == "SET") return "-ERR CONFIG SET is not supported\r\n";
+    if(subcommand != "GET"){
+        return "-ERR unknown subcommand '" + one_line(arguments[1]) + "'. Try CONFIG HELP.\r\n";
+    }
+    if(arguments.size() < 3) return "-ERR wrong number of arguments for 'config|get' command\r\n";
+
+    const bool aof_on = aof.enabled();
+    const std::vector<std::pair<std::string, std::string>> parameters{
+        {"port", std::to_string(settings.port)},
+        {"databases", "1"},
+        {"io-threads", std::to_string(settings.io_threads)},
+        {"appendonly", aof_on ? "yes" : "no"},
+        {"appendfsync", settings.sync_every_second ? "everysec" : "always"},
+        {"save", aof_on && settings.save_seconds > 0 ?
+                     std::to_string(settings.save_seconds) + " 1" : ""},
+        {"auto-aof-rewrite-percentage", settings.rewrite_min_size > 0 ? "100" : "0"},
+        {"auto-aof-rewrite-min-size", std::to_string(settings.rewrite_min_size)},
+        {"maxmemory", "0"},
+    };
+
+    std::vector<bool> chosen(parameters.size(), false);
+    for(std::size_t i = 2; i < arguments.size(); i++){
+        for(std::size_t j = 0; j < parameters.size(); j++){
+            if(commands::glob_match(arguments[i], parameters[j].first, true)) chosen[j] = true;
+        }
+    }
+    std::vector<std::string> encoded;
+    for(std::size_t j = 0; j < parameters.size(); j++){
+        if(!chosen[j]) continue;
+        encoded.push_back(protocol::encode_bulk_string(parameters[j].first));
+        encoded.push_back(protocol::encode_bulk_string(parameters[j].second));
+    }
+    return protocol::encode_array(encoded);
+}
+
 void log_persistence_failure(persistence::PersistResult result, const std::string& error) {
     if(result != persistence::PersistResult::ok) std::cerr << error << '\n';
 }
 
-// Run one request and log it. SAVE and BGREWRITEAOF need the AOF, so they are
-// handled here rather than in the command handler, which only sees the database.
+// Run one request and log it. SAVE, BGREWRITEAOF, INFO and CONFIG need the AOF
+// or server settings, so they are handled here rather than in the command
+// handler, which only sees the database.
 // Returns false when the AOF may be damaged and the server must stop.
 bool execute_request(const std::vector<std::string>& arguments, storage::Database& database,
                      persistence::Aof& aof, std::string& reply) {
     const std::string name = arguments.empty() ? "" : ascii_case(arguments[0], true);
+    if(name == "INFO"){
+        reply = info_reply(arguments, database, aof);
+        return true;
+    }
+    if(name == "CONFIG"){
+        reply = config_reply(arguments, aof);
+        return true;
+    }
     if(name == "SAVE" || name == "BGREWRITEAOF"){
         if(arguments.size() != 1){
             reply = "-ERR wrong number of arguments for '" + ascii_case(name, false) +
@@ -635,6 +768,8 @@ int run_server(std::uint16_t port, const std::string& aof_path,
     persistence::Aof aof(sync_every_second ? persistence::SyncPolicy::every_second
                                             : persistence::SyncPolicy::always);
     aof.set_schedule(std::chrono::seconds(save_seconds), rewrite_min_size);
+    settings = ServerSettings{port, io_threads, sync_every_second, save_seconds,
+                              rewrite_min_size, std::chrono::steady_clock::now()};
 
 
     stop_requested.store(false, std::memory_order_relaxed);
