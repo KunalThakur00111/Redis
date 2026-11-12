@@ -2,6 +2,7 @@
 
 #include "../protocol/resp_writer.h"
 #include "glob.h"
+#include "zset_commands.h"
 
 #include <cstdint>
 #include <string>
@@ -95,6 +96,10 @@ constexpr const char* supported_commands[] = {
     "HINCRBY", "HINCRBYFLOAT",
     "SMISMEMBER", "SINTER", "SUNION", "SDIFF", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE",
     "SPOP", "SRANDMEMBER", "SMOVE",
+    "ZADD", "ZINCRBY", "ZSCORE", "ZMSCORE", "ZCARD", "ZREM", "ZRANK", "ZREVRANK",
+    "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZRANGEBYLEX", "ZREVRANGEBYLEX",
+    "ZCOUNT", "ZLEXCOUNT", "ZPOPMIN", "ZPOPMAX",
+    "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX",
     "TYPE", "KEYS", "SCAN", "RENAME", "RENAMENX", "FLUSHDB", "FLUSHALL", "SELECT",
     "COMMAND", "INFO", "CONFIG", "SAVE", "BGREWRITEAOF",
 };
@@ -1394,6 +1399,8 @@ std::string execute_command(const std::vector<std::string>& arguments,
 
     std::string type_reply = execute_type_command(name, arguments, database);
     if(!type_reply.empty()) return type_reply;
+    std::string zset_reply = execute_zset_command(name, arguments, database);
+    if(!zset_reply.empty()) return zset_reply;
 
     if(name == "TYPE"){
         if(count != 2) return wrong_argument_count(name);

@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <deque>
 #include <fcntl.h>
 #include <filesystem>
@@ -83,11 +84,22 @@ std::vector<std::string> affected_keys(const std::vector<std::string>& arguments
                name == "LTRIM" || name == "LINSERT" || name == "HMSET" ||
                name == "HSETNX" || name == "HINCRBY" || name == "HINCRBYFLOAT" ||
                name == "SPOP" ||
+               name == "ZADD" || name == "ZINCRBY" || name == "ZREM" ||
+               name == "ZPOPMIN" || name == "ZPOPMAX" || name == "ZREMRANGEBYRANK" ||
+               name == "ZREMRANGEBYSCORE" || name == "ZREMRANGEBYLEX" ||
                // For the *STORE commands, arguments[1] is the destination.
                name == "SINTERSTORE" || name == "SUNIONSTORE" || name == "SDIFFSTORE")){
         keys.push_back(arguments[1]);
     }
     return keys;
+}
+
+// A score as text that strtod reads back as the same double: 17 significant
+// digits always round-trip, and "inf"/"-inf" are accepted by ZADD.
+std::string exact_score(double score) {
+    char buffer[32];
+    const int length = std::snprintf(buffer, sizeof(buffer), "%.17g", score);
+    return std::string(buffer, static_cast<std::size_t>(length));
 }
 
 // Append the commands that recreate one live key, including its absolute expiry.
@@ -103,6 +115,11 @@ void append_entry(std::string& output, const std::string& key, const storage::En
     } 
     else if(const auto* set = std::get_if<storage::Set>(&entry.value)){
         for(const auto& member : *set) append_command(output, {"SADD", key, member});
+    }
+    else if(const auto* zset = std::get_if<storage::SortedSet>(&entry.value)){
+        for(const auto* node = zset->list().first(); node; node = node->level[0].forward){
+            append_command(output, {"ZADD", key, exact_score(node->score), node->member});
+        }
     }
     if(entry.expires_at_ms){
         append_command(output, {"PEXPIREAT", key, std::to_string(*entry.expires_at_ms)});

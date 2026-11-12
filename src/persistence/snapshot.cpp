@@ -3,6 +3,7 @@
 #include "../storage/database.h"
 
 #include <chrono>
+#include <cmath>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -175,6 +176,29 @@ bool read_entry(Reader& reader, storage::Entry& entry, std::string& error) {
         entry.value = std::move(set);
     } 
 
+    else if(type == 5){// type 5 is sorted set
+        std::uint64_t count;
+        if(!reader.read_unsigned(count, 8) || count > reader.remaining() / 16){// a length and a score each
+            error = "Snapshot sorted set is invalid";
+            return false;
+        }
+        storage::SortedSet zset;
+        for(std::uint64_t i = 0; i < count; i++){
+            std::string member;
+            std::uint64_t bits;
+            if(!reader.read_string(member) || !reader.read_unsigned(bits, 8)){
+                error = "Snapshot sorted set is incomplete";
+                return false;
+            }
+            const double score = std::bit_cast<double>(bits);
+            if(std::isnan(score) || !zset.set(member, score)){// NaN cannot be ordered; members are unique
+                error = "Snapshot sorted set member is invalid";
+                return false;
+            }
+        }
+        entry.value = std::move(zset);
+    } 
+
     else {
         error = "Snapshot value type is unsupported";
         return false;
@@ -232,6 +256,18 @@ std::string encode_snapshot(const storage::Database& database, std::uint64_t aof
             append_expiry(output, entry);
             append_unsigned(output, set->size(), 8);
             for(const auto& member : *set) append_string(output, member);
+        }
+
+        else if(const auto* zset = std::get_if<storage::SortedSet>(&entry.value)){
+            // Type 5: each member, then its score's 8 bytes as stored, so the
+            // exact double (including -0 and infinities) is restored.
+            append_unsigned(output, 5, 1);
+            append_expiry(output, entry);
+            append_unsigned(output, zset->size(), 8);
+            for(const auto* node = zset->list().first(); node; node = node->level[0].forward){
+                append_string(output, node->member);
+                append_unsigned(output, std::bit_cast<std::uint64_t>(node->score), 8);
+            }
         }
     }
     append_unsigned(output, checksum(output), 4);

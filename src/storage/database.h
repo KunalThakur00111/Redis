@@ -11,6 +11,8 @@
 #include <variant>
 #include <unordered_set>
 
+#include "sorted_set.h"
+
 namespace storage {
 
 // A Redis hash maps field names to string values.
@@ -34,7 +36,7 @@ struct ListPopResult{
 };
 
 struct Entry{
-    std::variant<std::deque<std::string>, std::string, Hash, Set> value;
+    std::variant<std::deque<std::string>, std::string, Hash, Set, SortedSet> value;
     std::optional<std::int64_t> expires_at_ms;// store expiry in absolute unix millisecond
 };
 
@@ -410,7 +412,8 @@ struct Database {
         if(std::holds_alternative<std::string>(value)) return "string";
         if(std::holds_alternative<std::deque<std::string>>(value)) return "list";
         if(std::holds_alternative<Hash>(value)) return "hash";
-        return "set";
+        if(std::holds_alternative<Set>(value)) return "set";
+        return "zset";
     }
 
     // Names of every key that has not expired. Expired keys are left for

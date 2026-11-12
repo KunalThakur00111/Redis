@@ -14,6 +14,12 @@ strings over TCP and currently supports `PING`, `ECHO`, `SET`, `MSET`, `GET`, `D
   `HVALS`, `HMGET`, `HEXISTS`, `HSTRLEN`, `HINCRBY`, `HINCRBYFLOAT`
 - sets: `SMISMEMBER`, `SINTER`, `SUNION`, `SDIFF`, `SINTERSTORE`, `SUNIONSTORE`,
   `SDIFFSTORE`, `SPOP`, `SRANDMEMBER`, `SMOVE`
+- sorted sets: `ZADD` (`NX`, `XX`, `GT`, `LT`, `CH`, `INCR`), `ZINCRBY`, `ZSCORE`,
+  `ZMSCORE`, `ZCARD`, `ZREM`, `ZRANK` and `ZREVRANK` (with `WITHSCORE`), `ZRANGE`
+  (`BYSCORE`, `BYLEX`, `REV`, `LIMIT`, `WITHSCORES`), `ZREVRANGE`,
+  `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX`, `ZCOUNT`,
+  `ZLEXCOUNT`, `ZPOPMIN`, `ZPOPMAX`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`,
+  `ZREMRANGEBYLEX`
 
 With `--aof`, `SAVE` and `BGREWRITEAOF` control persistence.
 Admin commands: `TYPE`, `KEYS`, `SCAN` (with `MATCH`, `COUNT` and `TYPE`),
@@ -31,6 +37,16 @@ reorder its buckets at any insert. So, as in Redis, every key present for a whol
 scan is returned at least once. Unlike Redis, each `SCAN` call reads every key,
 so a full scan of N keys costs about N × N / COUNT. `INFO` reports
 `redis_version:8.2.9` because that is the compatibility target.
+
+A sorted set ([src/storage/sorted_set.h](src/storage/sorted_set.h)) pairs a hash
+map from member to score with a skip list ordered by score and then member
+bytes, as Redis does. Each skip-list link stores how many elements it skips, so
+`ZRANK`, rank ranges and `ZCOUNT` take O(log N). Scores are printed as Redis
+prints them: whole numbers as integers, otherwise the shortest digits that read
+back as the same double (`0.1`, `1e+20`, `0.00001`). Snapshots store each score's
+8 bytes, and the AOF writes 17 significant digits, so both restore the exact
+double. Each member is stored twice, in the map and in the skip list; Redis
+shares one copy.
 
 `INCRBYFLOAT` and `HINCRBYFLOAT` use `long double` and print 17 decimals with
 trailing zeros removed, as Redis does. `APPEND` refuses to grow a string past
@@ -218,7 +234,9 @@ commands to both servers and prints every reply that differs:
 ```
 
 `./build/differential-types-test` does the same for the string, list, hash and
-set commands, including their error replies and the order arguments are checked.
+set commands, including their error replies and the order arguments are checked,
+and `./build/differential-zset-test` for the sorted-set commands, including score
+formatting and range parsing.
 
 The differential tests are separate from the default `ctest` suite because a
 fresh clone does not contain the reference Redis binary.

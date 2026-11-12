@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <deque>
 #include <iostream>
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -33,6 +35,15 @@ int main() {
             storage::Hash{{"name", "Kunal"}, {"place", "Delhi"}}, std::nullopt});
         original.values.emplace("set", storage::Entry{
             storage::Set{"one", "two"}, std::nullopt});
+        {
+            storage::SortedSet zset;
+            zset.set("low", -std::numeric_limits<double>::infinity());
+            zset.set("zero", -0.0);
+            zset.set("tenth", 0.1);
+            zset.set(std::string("bin\0ary", 7), 1e300);
+            original.values.emplace("zset", storage::Entry{std::move(zset), deadline});
+            original.track_expiry("zset");
+        }
         original.values.emplace("expired", storage::Entry{
             std::string("old"), now_ms - 1000});
         original.track_expiry("expired");
@@ -45,7 +56,7 @@ int main() {
         check(persistence::decode_snapshot(encoded, restored, offset, error),
               "snapshot did not decode");
         check(offset == 12345, "AOF checkpoint was not restored");
-        check(restored.values.size() == 4 && restored.values.count("stale") == 0 &&
+        check(restored.values.size() == 5 && restored.values.count("stale") == 0 &&
               restored.values.count("expired") == 0,
               "snapshot did not replace the database or skip expired keys");
         check(std::get<std::string>(restored.values.at(binary_key).value) == binary_value,
@@ -62,12 +73,19 @@ int main() {
         check(std::get<storage::Set>(restored.values.at("set").value) ==
                   std::get<storage::Set>(original.values.at("set").value),
               "set did not round-trip");
+        {
+            const auto& zset = std::get<storage::SortedSet>(restored.values.at("zset").value);
+            check(zset == std::get<storage::SortedSet>(original.values.at("zset").value) &&
+                  std::signbit(*zset.score("zero")) && zset.rank("low") == 0 &&
+                  zset.list().size() == 4 && restored.values.at("zset").expires_at_ms == deadline,
+                  "sorted set, its exact scores or its order did not round-trip");
+        }
 
         std::string damaged = encoded;
         damaged[damaged.size() / 2] ^= 1;
         check(!persistence::decode_snapshot(damaged, restored, offset, error),
               "damaged snapshot was accepted");
-        check(restored.values.size() == 4 && offset == 12345,
+        check(restored.values.size() == 5 && offset == 12345,
               "damaged snapshot changed the destination");
 
         for(std::size_t length = 0; length < encoded.size(); length++){
@@ -75,7 +93,7 @@ int main() {
                       std::string_view(encoded.data(), length), restored, offset, error),
                   "truncated snapshot was accepted");
         }
-        check(restored.values.size() == 4 && offset == 12345,
+        check(restored.values.size() == 5 && offset == 12345,
               "truncated snapshot changed the destination");
 
         std::cout << "Snapshot tests passed\n";

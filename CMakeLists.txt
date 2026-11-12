@@ -18,6 +18,7 @@ add_executable(redis-server
     src/protocol/resp_writer.cpp
     src/commands/command_handler.cpp
     src/commands/glob.cpp
+    src/commands/zset_commands.cpp
 )
 target_compile_options(redis-server PRIVATE -Wall -Wextra -Wpedantic)
 find_package(Threads REQUIRED)
@@ -39,6 +40,10 @@ if(BUILD_TESTING)
     target_compile_options(glob-test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME glob COMMAND glob-test)
 
+    add_executable(sorted-set-test tests/sorted_set_test.cpp)
+    target_compile_options(sorted-set-test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME sorted-set COMMAND sorted-set-test)
+
     add_executable(snapshot-test
         tests/snapshot_test.cpp
         src/persistence/snapshot.cpp
@@ -54,6 +59,7 @@ if(BUILD_TESTING)
         src/protocol/resp_writer.cpp
         src/commands/command_handler.cpp
         src/commands/glob.cpp
+        src/commands/zset_commands.cpp
     )
     target_compile_options(aof-sync-test PRIVATE -Wall -Wextra -Wpedantic)
     target_link_libraries(aof-sync-test PRIVATE Threads::Threads)
@@ -63,6 +69,7 @@ if(BUILD_TESTING)
     add_executable(socket-commands-test tests/socket_commands_test.cpp)
     add_executable(admin-commands-test tests/admin_commands_test.cpp)
     add_executable(type-commands-test tests/type_commands_test.cpp)
+    add_executable(zset-persistence-test tests/zset_persistence_test.cpp)
     add_executable(aof-restart-test
         tests/aof_restart_test.cpp
         src/persistence/snapshot.cpp
@@ -76,12 +83,14 @@ if(BUILD_TESTING)
     add_executable(differential-ping-test tests/differential_ping_test.cpp)
     add_executable(differential-admin-test tests/differential_admin_test.cpp)
     add_executable(differential-types-test tests/differential_types_test.cpp)
+    add_executable(differential-zset-test tests/differential_zset_test.cpp)
     add_executable(io-threads-bench benchmarks/io_threads.cpp)
     add_executable(command-latency-bench benchmarks/command_latency.cpp)
-    foreach(target socket-commands-test admin-commands-test type-commands-test aof-restart-test aof-sigint-test aof-rewrite-test
+    foreach(target socket-commands-test admin-commands-test type-commands-test
+                   zset-persistence-test aof-restart-test aof-sigint-test aof-rewrite-test
                    io-threads-test
                    differential-ping-test differential-admin-test
-                   differential-types-test io-threads-bench command-latency-bench)
+                   differential-types-test differential-zset-test io-threads-bench command-latency-bench)
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
         target_link_libraries(${target} PRIVATE Threads::Threads)
     endforeach()
@@ -98,6 +107,10 @@ if(BUILD_TESTING)
         COMMAND type-commands-test $<TARGET_FILE:redis-server>)
     add_test(NAME type-commands-single-thread
         COMMAND type-commands-test $<TARGET_FILE:redis-server> --io-threads 1)
+    add_test(NAME zset-persistence
+        COMMAND zset-persistence-test $<TARGET_FILE:redis-server>)
+    add_test(NAME zset-persistence-single-thread-always
+        COMMAND zset-persistence-test $<TARGET_FILE:redis-server> --io-threads 1 --aof-fsync always)
     add_test(NAME aof-restart
         COMMAND aof-restart-test $<TARGET_FILE:redis-server>)
     add_test(NAME aof-restart-everysec
