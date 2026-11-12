@@ -270,6 +270,7 @@ bool execute_request(const std::vector<std::string>& arguments, storage::Databas
         return true;
     }
 
+    aof.note_before_command(arguments, database);
     reply = commands::execute_command(arguments, database);
     std::string aof_error;
     if(!aof.append_after_command(arguments, reply, database, aof_error)){

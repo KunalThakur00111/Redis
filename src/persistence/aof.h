@@ -43,6 +43,10 @@ class Aof {
         bool stop_sync_ = false;// Tells the worker that normal Aof destruction has begun.
         std::string sync_error_;// An error from the worker that the event loop must notice.
 
+        // Set by note_before_command() for the next append_after_command().
+        bool key_was_stable_ = false;
+        std::string stable_key_;
+
         // These are changed only while the caller holds the database lock.
         std::uint64_t changes_since_save_ = 0;// logged writes since the last snapshot
         std::chrono::steady_clock::time_point last_save_;
@@ -66,6 +70,13 @@ class Aof {
                             std::string& error, std::uint64_t snapshot_offset = 0,
                             std::string_view snapshot_checksum = {});
                             
+        // Call just before running a command, under the same database lock as
+        // append_after_command(). It records whether the command's key is live
+        // with no expiry, which is when a short record of the write is safe.
+        // Without this call, every write logs the whole affected keys.
+        void note_before_command(const std::vector<std::string>& arguments,
+                                 const storage::Database& database);
+
         bool append_after_command(const std::vector<std::string>& arguments,
                                 const std::string& reply, storage::Database& database,
                                 std::string& error);

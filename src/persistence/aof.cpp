@@ -42,6 +42,15 @@ void append_command(std::string& output, std::initializer_list<std::string> argu
     }
 }
 
+void append_arguments(std::string& output, const std::vector<std::string>& arguments) {
+    output += "*" + std::to_string(arguments.size()) + "\r\n";
+    for(const auto& argument : arguments){
+        output += "$" + std::to_string(argument.size()) + "\r\n";
+        output += argument;
+        output += "\r\n";
+    }
+}
+
 std::string checkpoint_record(std::string_view checksum_bytes) {
     std::string marker = "MRSNAP:";
     marker.append(checksum_bytes);
@@ -124,6 +133,56 @@ void append_entry(std::string& output, const std::string& key, const storage::En
     if(entry.expires_at_ms){
         append_command(output, {"PEXPIREAT", key, std::to_string(*entry.expires_at_ms)});
     }
+}
+
+/*
+Single-key writes that can be logged as the command itself.
+
+Each depends only on its own arguments and the key's value just before it, with
+no clock or randomness, so replaying it on the same earlier value gives the same
+result. That holds only if replay is sure to see the same earlier value, which
+needs the key to have been live with no expiry just before the command:
+
+- A key with an expiry may have expired by the time the log is replayed; the
+  replayed command would then recreate it without that expiry.
+- A key that was missing may have held an older value that expired; replayed on
+  a machine whose clock is behind, that older value could still be live.
+- An earlier record of the key may end with a deadline that later commands
+  extended or removed; replayed after that deadline, the key is already gone
+  when a short record expects it.
+
+A key live with no expiry has none of these problems: whatever records rebuilt
+it, the last one that touched its expiry left it with none. So only then is the
+short form logged; otherwise the key's whole final state is, starting with DEL.
+
+This keeps a write to a large list, hash, set or sorted set about as small in
+the log as the command was, instead of the size of the whole key.
+*/
+bool replays_exactly(const std::string& name) {
+    static const char* const names[] = {
+        "APPEND",
+        "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LREM", "LTRIM", "LINSERT",
+        "HSET", "HMSET", "HDEL", "HSETNX", "HINCRBY", "HINCRBYFLOAT",
+        "SADD", "SREM",
+        "ZADD", "ZINCRBY", "ZREM", "ZPOPMIN", "ZPOPMAX",
+        "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX",
+    };
+    for(const char* candidate : names) if(name == candidate) return true;
+    return false;
+}
+
+bool is_expiry_command(const std::string& name) {
+    return name == "EXPIRE" || name == "PEXPIRE" || name == "EXPIREAT" ||
+           name == "PEXPIREAT" || name == "PERSIST";
+}
+
+// The members SPOP returned: one bulk string, or an array of them.
+std::vector<std::string> popped_members(const std::string& reply) {
+    if(reply.empty() || reply == "$-1\r\n") return {};
+    const std::string as_array = reply[0] == '$' ? "*1\r\n" + reply : reply;
+    auto parsed = protocol::parse_request(as_array);
+    if(parsed.status != protocol::ParseStatus::complete) return {};
+    return parsed.arguments;
 }
 
 std::string snapshot_keys(const std::vector<std::string>& keys, storage::Database& database) {
@@ -409,9 +468,23 @@ bool Aof::start_sync_thread(std::string& error) {
     return true;
 }
 
+void Aof::note_before_command(const std::vector<std::string>& arguments,
+                              const storage::Database& database) {
+    key_was_stable_ = false;
+    if(fd_ < 0 || arguments.size() < 2) return;
+    // A key with no expiry cannot be expired, so no clock check is needed.
+    auto found = database.values.find(arguments[1]);
+    key_was_stable_ = found != database.values.end() && !found->second.expires_at_ms;
+    if(key_was_stable_) stable_key_ = arguments[1];
+}
+
 bool Aof::append_after_command(const std::vector<std::string>& arguments,
                                const std::string& reply, storage::Database& database,
                                std::string& error) {
+
+    // Use the note for this command only, then clear it.
+    const bool stable = key_was_stable_ && arguments.size() >= 2 && stable_key_ == arguments[1];
+    key_was_stable_ = false;
 
     if(!check_sync_error(error)) return false;
     if(fd_ < 0 || reply.empty() || reply[0] == '-') return true;
@@ -422,6 +495,37 @@ bool Aof::append_after_command(const std::vector<std::string>& arguments,
         // The keys are already gone, so log the command itself; replaying it
         // empties the database at the same point in the log.
         append_command(record, {"FLUSHALL"});
+    } 
+    else if(arguments.size() >= 2 && (replays_exactly(name) || name == "SPOP")){
+        const std::string& key = arguments[1];
+        auto found = database.find_live(key);
+        if(stable && found != database.values.end() && !found->second.expires_at_ms){
+            if(name == "SPOP"){
+                // SPOP chooses at random, so log what it removed, as Redis does.
+                const auto members = popped_members(reply);
+                if(members.empty()) return true;// nothing changed
+                std::vector<std::string> command{"SREM", key};
+                command.insert(command.end(), members.begin(), members.end());
+                append_arguments(record, command);
+            } 
+            else {
+                append_arguments(record, arguments);
+            }
+        } 
+        else {
+            record = snapshot_keys({key}, database);// had or has an expiry, was new, or is gone
+        }
+    } 
+    else if(stable && is_expiry_command(name)){
+        // The key had no expiry, so only the new one (or a deletion by a past
+        // deadline) needs logging, not the whole value.
+        const std::string& key = arguments[1];
+        auto found = database.find_live(key);
+        if(found == database.values.end()) append_command(record, {"DEL", key});
+        else if(found->second.expires_at_ms){
+            append_command(record, {"PEXPIREAT", key, std::to_string(*found->second.expires_at_ms)});
+        } 
+        else append_command(record, {"PERSIST", key});
     } 
     else {
         const auto keys = affected_keys(arguments);

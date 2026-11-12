@@ -162,7 +162,8 @@ public:
             _exit(127);
         }
         try {
-            for(int attempt = 0; attempt < 100; attempt++){
+            // Up to 10 s: replaying a large AOF under sanitizers can take a few seconds.
+            for(int attempt = 0; attempt < 500; attempt++){
                 int status = 0;
                 if(exited(status)) throw std::runtime_error("server exited during startup");
                 try {

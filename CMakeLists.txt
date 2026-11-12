@@ -70,6 +70,7 @@ if(BUILD_TESTING)
     add_executable(admin-commands-test tests/admin_commands_test.cpp)
     add_executable(type-commands-test tests/type_commands_test.cpp)
     add_executable(zset-persistence-test tests/zset_persistence_test.cpp)
+    add_executable(aof-compact-test tests/aof_compact_test.cpp)
     add_executable(aof-restart-test
         tests/aof_restart_test.cpp
         src/persistence/snapshot.cpp
@@ -87,7 +88,7 @@ if(BUILD_TESTING)
     add_executable(io-threads-bench benchmarks/io_threads.cpp)
     add_executable(command-latency-bench benchmarks/command_latency.cpp)
     foreach(target socket-commands-test admin-commands-test type-commands-test
-                   zset-persistence-test aof-restart-test aof-sigint-test aof-rewrite-test
+                   zset-persistence-test aof-compact-test aof-restart-test aof-sigint-test aof-rewrite-test
                    io-threads-test
                    differential-ping-test differential-admin-test
                    differential-types-test differential-zset-test io-threads-bench command-latency-bench)
@@ -111,6 +112,10 @@ if(BUILD_TESTING)
         COMMAND zset-persistence-test $<TARGET_FILE:redis-server>)
     add_test(NAME zset-persistence-single-thread-always
         COMMAND zset-persistence-test $<TARGET_FILE:redis-server> --io-threads 1 --aof-fsync always)
+    add_test(NAME aof-compact
+        COMMAND aof-compact-test $<TARGET_FILE:redis-server>)
+    add_test(NAME aof-compact-single-thread
+        COMMAND aof-compact-test $<TARGET_FILE:redis-server> --io-threads 1)
     add_test(NAME aof-restart
         COMMAND aof-restart-test $<TARGET_FILE:redis-server>)
     add_test(NAME aof-restart-everysec

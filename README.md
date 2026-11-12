@@ -132,8 +132,19 @@ before starting this one.
 ## Optional persistence
 
 Pass `--aof path` to replay an existing log at startup and record later writes.
-The parent directory must exist. The log stores length-framed RESP commands
-describing each affected key's resulting value and absolute expiry deadline.
+The parent directory must exist. The log stores length-framed RESP commands.
+Most writes are recorded as the resulting value of each affected key with its
+absolute expiry deadline. Single-key writes to lists, hashes, sets and sorted
+sets (and `APPEND`) are recorded as the command itself when the key was live
+with no expiry just before the command and has none afterwards: they depend on
+nothing but the key's earlier value, so replaying them gives the same result,
+and the record stays the size of the command however large the key is.
+`SPOP` is recorded as an `SREM` of the members it removed, and an `EXPIRE`-family
+command on such a key as just the new deadline (`PEXPIREAT`), `PERSIST`, or `DEL`.
+Any other case keeps the whole-value record, which starts with `DEL`: a key with
+an expiry could expire before the log is replayed, a new key could have an older
+expired value that a replaying machine with a slower clock still sees, and a
+short record after an earlier record's deadline would find the key already gone.
 An incomplete final record is discarded on restart. This is a custom format,
 not a Redis-compatible AOF file.
 
@@ -142,8 +153,9 @@ and syncs pending writes approximately once per second in a background thread.
 It reduces per-write latency but can lose recent acknowledged writes after an
 operating-system crash or power failure. `--aof-fsync always` calls `fdatasync`
 before acknowledging each logged write. A background sync can still delay a
-concurrent write to the same file. The log records a whole affected key after
-a write, so large values make each write record large.
+concurrent write to the same file. Writes that record a whole key, such as
+`RENAME`, `SMOVE`, the `…STORE` commands, and writes to a large key with an
+expiry, still make records as large as that key.
 
 A snapshot is written to `<aof path>.snapshot` on a clean shutdown, by `SAVE`,
 and every `--save-seconds` seconds if at least one write was logged since the
