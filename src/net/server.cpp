@@ -56,6 +56,9 @@ struct Client {
     bool read_closed = false;// client have nothing to send, in that case this is used( after clearing output buffer, close socket)
     bool closed_after_reply = false;// client send the invalid arguments, after replying close this socket
     std::uint32_t watched_events = EPOLLIN;
+    bool in_multi = false;// between MULTI and EXEC/DISCARD
+    bool multi_failed = false;// a bad command was queued, so EXEC must abort
+    std::vector<std::vector<std::string>> queued;
 };
 
 // Put a socket in nonblocking mode so accept/recv/send never wait for data.
@@ -280,6 +283,82 @@ bool execute_request(const std::vector<std::string>& arguments, storage::Databas
     return true;
 }
 
+// MULTI, EXEC and DISCARD, then everything else. The caller holds the
+// database lock, so an EXEC runs all its commands with no other client between.
+// Returns false when the AOF may be damaged and the server must stop.
+bool run_client_request(Client& client, const std::vector<std::string>& arguments,
+                        storage::Database& database, persistence::Aof& aof, std::string& reply) {
+    const std::string name = arguments.empty() ? "" : ascii_case(arguments[0], true);
+    const bool control = name == "MULTI" || name == "EXEC" || name == "DISCARD";
+
+    if(control && arguments.size() != 1){
+        const std::string error = "wrong number of arguments for '" + ascii_case(name, false) + "' command";
+        if(client.in_multi && name == "EXEC"){
+            // Like Redis, a bad EXEC ends the transaction right away.
+            client.in_multi = false;
+            client.multi_failed = false;
+            client.queued.clear();
+            reply = "-EXECABORT Transaction discarded because of: " + error + "\r\n";
+            return true;
+        }
+        if(client.in_multi) client.multi_failed = true;
+        reply = "-ERR " + error + "\r\n";
+        return true;
+    }
+    if(name == "MULTI"){
+        reply = client.in_multi ? "-ERR MULTI calls can not be nested\r\n" : "+OK\r\n";
+        client.in_multi = true;
+        return true;
+    }
+    if(name == "EXEC" || name == "DISCARD"){
+        if(!client.in_multi){
+            reply = "-ERR " + name + " without MULTI\r\n";
+            return true;
+        }
+        auto queued = std::move(client.queued);
+        const bool failed = client.multi_failed;
+        client.queued.clear();
+        client.in_multi = false;
+        client.multi_failed = false;
+        if(name == "DISCARD"){
+            reply = "+OK\r\n";
+            return true;
+        }
+        if(failed){
+            reply = "-EXECABORT Transaction discarded because of previous errors.\r\n";
+            return true;
+        }
+        aof.begin_batch();
+        std::vector<std::string> replies;
+        for(const auto& command : queued){
+            std::string one;
+            if(!execute_request(command, database, aof, one)) return false;
+            replies.push_back(std::move(one));
+        }
+        std::string error;
+        if(!aof.end_batch(error)){
+            std::cerr << error << '\n';
+            return false;
+        }
+        reply = protocol::encode_array(replies);
+        return true;
+    }
+    if(client.in_multi){
+        // shortcut: only unknown commands abort the transaction here; a wrong
+        // argument count shows up as an error inside EXEC's reply. Add an
+        // arity table if a client needs Redis's behaviour.
+        if(!commands::is_known_command(name)){
+            client.multi_failed = true;
+            reply = "-ERR unknown command\r\n";
+            return true;
+        }
+        client.queued.push_back(arguments);
+        reply = "+QUEUED\r\n";
+        return true;
+    }
+    return execute_request(arguments, database, aof, reply);
+}
+
 // Returns false when scheduled persistence failed in a way that must stop the server.
 bool run_scheduled_persistence(storage::Database& database, persistence::Aof& aof) {
     std::string error;
@@ -309,7 +388,7 @@ bool process_input(Client& client, storage::Database& database,
         }
 
         std::string reply;
-        if(!execute_request(request.arguments, database, aof, reply)){
+        if(!run_client_request(client, request.arguments, database, aof, reply)){
             aof_failed = true;
             return false;
         }
@@ -458,7 +537,7 @@ class IoWorker {
                 std::string command_reply;
                 {
                     std::lock_guard<std::mutex> lock(direct_execution_.mutex);
-                    if(!execute_request(parsed.arguments, direct_execution_.database,
+                    if(!run_client_request(client, parsed.arguments, direct_execution_.database,
                                         direct_execution_.aof, command_reply)){
                         direct_execution_.failed.store(true, std::memory_order_relaxed);
                         stop_requested.store(true, std::memory_order_relaxed);
@@ -558,7 +637,7 @@ class IoWorker {
                 close(socket);
                 continue;
             }
-            clients_.emplace(socket, Client{socket, {}, {}, false, false, EPOLLIN});
+            clients_.emplace(socket, Client{socket, {}, {}, false, false, EPOLLIN, false, false, {}});
         }
         return true;
     }
@@ -957,7 +1036,7 @@ int run_server(std::uint16_t port, const std::string& aof_path,
                         close(connection);
                         continue;
                     }
-                    clients.emplace(connection, Client{connection, {}, {}, false,false,EPOLLIN});
+                    clients.emplace(connection, Client{connection, {}, {}, false, false, EPOLLIN, false, false, {}});
                 }
                 continue;
             }

@@ -532,6 +532,32 @@ bool Aof::append_after_command(const std::vector<std::string>& arguments,
         if(keys.empty()) return true;
         record = snapshot_keys(keys, database);
     }
+    changes_since_save_++;
+    if(batching_){
+        batch_ += record;// end_batch() writes the whole EXEC as one record
+        return true;
+    }
+    return write_record(record, error);
+}
+
+void Aof::begin_batch() {
+    batching_ = fd_ >= 0;
+    batch_.clear();
+}
+
+bool Aof::end_batch(std::string& error) {
+    batching_ = false;
+    return flush_batch(error);
+}
+
+bool Aof::flush_batch(std::string& error) {
+    if(batch_.empty()) return true;
+    std::string record;
+    record.swap(batch_);
+    return write_record(record, error);
+}
+
+bool Aof::write_record(const std::string& record, std::string& error) {
     if(record.empty() || record.size() > max_record_size){
         error = "AOF record exceeds the 64 MiB limit";
         return false;
@@ -541,7 +567,6 @@ bool Aof::append_after_command(const std::vector<std::string>& arguments,
 
     if(!write_all(fd_, header, sizeof(header), error) ||
        !write_all(fd_, record.data(), record.size(), error)) return false;
-    changes_since_save_++;
 
     if(sync_policy_ == SyncPolicy::every_second){
         {
@@ -627,6 +652,8 @@ PersistResult Aof::save_snapshot(storage::Database& database, std::string& error
         return PersistResult::failed;
     }
     if(!check_sync_error(error)) return PersistResult::fatal;
+    // SAVE inside EXEC: log the earlier commands first, so the snapshot does not include them twice.
+    if(!flush_batch(error)) return PersistResult::fatal;
 
     std::uint64_t aof_offset;
     if(!next_snapshot_offset(aof_offset, error)) return PersistResult::fatal;
@@ -663,6 +690,8 @@ PersistResult Aof::rewrite(storage::Database& database, std::string& error) {
         return PersistResult::failed;
     }
     if(!check_sync_error(error)) return PersistResult::fatal;
+    // BGREWRITEAOF inside EXEC: same reason as in save_snapshot().
+    if(!flush_batch(error)) return PersistResult::fatal;
 
     // Collect names first: find_live() erases an expired key, which would
     // invalidate an iterator over database.values.

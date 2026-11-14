@@ -27,6 +27,12 @@ Admin commands: `TYPE`, `KEYS`, `SCAN` (with `MATCH`, `COUNT` and `TYPE`),
 (server, persistence and keyspace sections), `CONFIG GET`, and `COMMAND COUNT`,
 `COMMAND LIST` and `COMMAND DOCS` (which returns no documentation, so
 `redis-cli` works without command hints).
+
+Transactions: `MULTI`, `EXEC` and `DISCARD`. `EXEC` runs the queued commands
+with no other client's command in between, and the AOF stores the whole `EXEC`
+as one record, so a crash keeps all of it or none. `WATCH` is not supported. An
+unknown command queued after `MULTI` aborts the transaction as in Redis, but a
+wrong argument count only shows up as an error inside `EXEC`'s reply.
 `SET` supports `NX`, `XX`, `EX`, `PX`, `EXAT`, and `PXAT`, including a condition
 with an expiry.
 

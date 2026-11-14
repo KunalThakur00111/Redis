@@ -46,6 +46,11 @@ class Aof {
         // Set by note_before_command() for the next append_after_command().
         bool key_was_stable_ = false;
         std::string stable_key_;
+        bool batching_ = false;// inside EXEC
+        std::string batch_;// EXEC's records so far
+
+        bool write_record(const std::string& record, std::string& error);
+        bool flush_batch(std::string& error);
 
         // These are changed only while the caller holds the database lock.
         std::uint64_t changes_since_save_ = 0;// logged writes since the last snapshot
@@ -80,6 +85,11 @@ class Aof {
         bool append_after_command(const std::vector<std::string>& arguments,
                                 const std::string& reply, storage::Database& database,
                                 std::string& error);
+
+        // Log every write between these two calls as one record, so a crash
+        // never leaves half of a MULTI/EXEC transaction in the log.
+        void begin_batch();
+        bool end_batch(std::string& error);
 
         bool current_offset(std::uint64_t& offset, std::string& error) const;
         bool next_snapshot_offset(std::uint64_t& offset, std::string& error) const;

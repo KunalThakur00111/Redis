@@ -55,6 +55,19 @@ int main(int argc, char* argv[]) {
             {{"CONFIG", "GET", "appendonly", "appendonly"}},
 
             {{"INFO", "nosuchsection"}},
+
+            // MULTI / EXEC / DISCARD
+            {{"EXEC"}}, {{"DISCARD"}}, {{"MULTI", "x"}},
+            {{"MULTI"}}, {{"SET", "t", "1"}}, {{"INCR", "t"}}, {{"GET", "t"}}, {{"EXEC"}},
+            {{"MULTI"}}, {{"MULTI"}}, {{"INCR", "t"}}, {{"EXEC"}},
+            {{"MULTI"}}, {{"SET", "gone", "x"}}, {{"DISCARD"}}, {{"GET", "gone"}},
+            {{"MULTI"}}, {{"EXEC"}},
+            {{"SET", "word", "abc"}},
+            {{"MULTI"}}, {{"INCR", "word"}}, {{"SET", "after", "1"}}, {{"EXEC"}}, {{"GET", "after"}},
+            // Unknown commands word their error differently, so only the reply type is compared.
+            {{"MULTI"}}, {{"SET", "never", "1"}}, {{"NOSUCHCOMMAND"}, Compare::shape}, {{"EXEC"}},
+            {{"GET", "never"}},
+            {{"MULTI"}}, {{"SET", "never", "1"}}, {{"EXEC", "x"}}, {{"EXEC"}}, {{"GET", "never"}},
         };
         return differential::run(argv[1], argv[2], cases, "admin command");
     } catch(const std::exception& error){

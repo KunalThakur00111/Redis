@@ -3,6 +3,7 @@
 #include "test_support.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <iostream>
 #include <set>
 
@@ -249,6 +250,39 @@ int main(int argc, char* argv[]) {
             const std::string restored_ttl = run({"TTL", "target"});
             TEST_CHECK(restored_ttl != ":-1\r\n" && restored_ttl != ":-2\r\n");
             TEST_CHECK(run({"DBSIZE"}) == ":1\r\n");
+        }
+
+        // An EXEC is one AOF record: cutting that record short (a crash while
+        // writing it) drops the whole transaction, never half of it.
+        {
+            test::TemporaryDirectory directory;
+            const std::string aof_path = directory.path() + "/data.aof";
+            std::vector<std::string> options{"--aof", aof_path, "--save-seconds", "0"};
+            options.insert(options.end(), extra.begin(), extra.end());
+            std::uintmax_t before_exec = 0;
+            {
+                test::Server persistent(binary, options);
+                test::Fd connection = test::connect_to(persistent.port());
+                auto run = [&](std::initializer_list<std::string_view> args, std::size_t reply_size){
+                    test::send_all(connection.get(), test::request(args));
+                    return test::read_exact(connection.get(), reply_size);
+                };
+                TEST_CHECK(run({"SET", "kept", "yes"}, 5) == "+OK\r\n");
+                before_exec = std::filesystem::file_size(aof_path);
+                TEST_CHECK(run({"MULTI"}, 5) == "+OK\r\n");
+                TEST_CHECK(run({"SET", "a", "1"}, 9) == "+QUEUED\r\n");
+                TEST_CHECK(run({"SET", "b", "2"}, 9) == "+QUEUED\r\n");
+                TEST_CHECK(run({"EXEC"}, 14) == "*2\r\n+OK\r\n+OK\r\n");
+                persistent.stop();
+            }
+            std::filesystem::resize_file(aof_path, std::filesystem::file_size(aof_path) - 1);
+            test::Server persistent(binary, options);
+            auto run = [&](std::initializer_list<std::string_view> args){
+                return test::exchange_request(persistent.port(), args);
+            };
+            TEST_CHECK(std::filesystem::file_size(aof_path) == before_exec);// the cut record was dropped
+            TEST_CHECK(run({"GET", "kept"}) == "$3\r\nyes\r\n");
+            TEST_CHECK(run({"EXISTS", "a", "b"}) == ":0\r\n");
         }
     } catch(const std::exception& failure){
         std::cerr << failure.what() << '\n';

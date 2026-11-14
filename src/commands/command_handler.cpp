@@ -101,7 +101,7 @@ constexpr const char* supported_commands[] = {
     "ZCOUNT", "ZLEXCOUNT", "ZPOPMIN", "ZPOPMAX",
     "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX",
     "TYPE", "KEYS", "SCAN", "RENAME", "RENAMENX", "FLUSHDB", "FLUSHALL", "SELECT",
-    "COMMAND", "INFO", "CONFIG", "SAVE", "BGREWRITEAOF",
+    "COMMAND", "INFO", "CONFIG", "SAVE", "BGREWRITEAOF", "MULTI", "EXEC", "DISCARD",
 };
 
 // Text quoted inside an error reply must not end the line early.
@@ -752,6 +752,11 @@ std::string execute_type_command(const std::string& name,
 }
 
 }  // namespace
+
+bool is_known_command(const std::string& name) {
+    for(const char* command : supported_commands) if(name == command) return true;
+    return false;
+}
 
 std::string execute_command(const std::vector<std::string>& arguments,
                             storage::Database& database) {
